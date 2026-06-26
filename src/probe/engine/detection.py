@@ -1,27 +1,7 @@
 """Detection training and inference for PROBE Phase 3.
 
-Implements the paper's Section 3.5 downstream detection pipeline:
 FCOS-style dense prediction with [l, t, r, b] box encoding, Focal Loss,
-GIoU regression loss, and VOC 11-point mAP evaluation.
-
-Grid layout
------------
-ViT-Base/16 on image_size×image_size inputs produces a sqrt(N)×sqrt(N)
-patch-token grid.  Each grid cell corresponds to a stride×stride px region:
-
-    stride = image_size / sqrt(N)
-    x_ctr = j * stride + stride / 2
-    y_ctr = i * stride + stride / 2
-
-Box encoding (FCOS)
---------------------
-For a grid centre (x_ctr, y_ctr) and a GT box [x1, y1, x2, y2]:
-
-    l* = (x_ctr - x1) / stride       t* = (y_ctr - y1) / stride
-    r* = (x2 - x_ctr) / stride       b* = (y2 - y_ctr) / stride
-
-A location is *positive* iff the grid centre falls inside the GT box.
-Predictions are in log-space; decoding uses exp() to ensure positivity.
+GIoU regression loss, centerness BCE, and VOC 11-point mAP evaluation.
 """
 
 from __future__ import annotations
@@ -45,12 +25,11 @@ def generate_grid(
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Return [feature_size * feature_size, 2] grid of (x_ctr, y_ctr) in image px."""
     half = stride / 2.0
     shifts = torch.arange(0, feature_size, device=device, dtype=dtype) * stride + half
     shift_y, shift_x = torch.meshgrid(shifts, shifts, indexing="ij")
     locations = torch.stack([shift_x.reshape(-1), shift_y.reshape(-1)], dim=-1)
-    return locations  # [H*W, 2]
+    return locations
 
 
 # ---------------------------------------------------------------------------
@@ -58,21 +37,12 @@ def generate_grid(
 # ---------------------------------------------------------------------------
 
 def encode_boxes(
-    gt_boxes: torch.Tensor,       # [N, 4]  — [x1, y1, x2, y2]
-    locations: torch.Tensor,      # [K, 2]  — (x_ctr, y_ctr)
+    gt_boxes: torch.Tensor,
+    locations: torch.Tensor,
     stride: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Encode GT boxes as [l, t, r, b] distance targets (stride-normalised).
-
-    Returns
-    -------
-    targets :      [K, 4]   — [l*, t*, r*, b*], 0 for negative locations
-    mask :         [K] bool — True if location falls inside *any* GT box
-    assigned_idx : [K] int64 — index of assigned GT box, -1 for negatives
-    """
     K = locations.shape[0]
     N = gt_boxes.shape[0]
-
     if N == 0:
         return (
             torch.zeros(K, 4, device=locations.device),
@@ -80,73 +50,66 @@ def encode_boxes(
             torch.full((K,), -1, dtype=torch.int64, device=locations.device),
         )
 
-    x_ctr = locations[:, 0]  # [K]
-    y_ctr = locations[:, 1]  # [K]
-
+    x_ctr, y_ctr = locations[:, 0], locations[:, 1]
     x1, y1, x2, y2 = gt_boxes[:, 0], gt_boxes[:, 1], gt_boxes[:, 2], gt_boxes[:, 3]
 
-    # [K, N] — distance from each location to each box's four sides
     l = x_ctr[:, None] - x1[None, :]
     t = y_ctr[:, None] - y1[None, :]
     r = x2[None, :] - x_ctr[:, None]
     b = y2[None, :] - y_ctr[:, None]
 
-    # A location is inside a box if all four distances are > 0
-    inside = (l > 0.0) & (t > 0.0) & (r > 0.0) & (b > 0.0)  # [K, N]
-
-    # For locations inside multiple boxes, assign the one with smallest area
-    areas = (x2 - x1) * (y2 - y1)  # [N]
+    inside = (l > 0.0) & (t > 0.0) & (r > 0.0) & (b > 0.0)
+    areas = (x2 - x1) * (y2 - y1)
     inside_float = inside.float()
     huge = areas.max() + 1.0
     masked_areas = inside_float * areas[None, :] + (1.0 - inside_float) * huge
-    assigned_idx = masked_areas.argmin(dim=1)  # [K]
-    mask = inside_float.sum(dim=1) > 0  # [K]
-
+    assigned_idx = masked_areas.argmin(dim=1)
+    mask = inside_float.sum(dim=1) > 0
     assigned_idx[~mask] = -1
 
-    # Gather the assigned box for each location
     idx_safe = assigned_idx.clamp(min=0)
-    assigned_boxes = gt_boxes[idx_safe]  # [K, 4]
-
-    # Compute targets in pixel space, then normalise by stride
-    lt = torch.stack(
-        [
-            x_ctr - assigned_boxes[:, 0],
-            y_ctr - assigned_boxes[:, 1],
-            assigned_boxes[:, 2] - x_ctr,
-            assigned_boxes[:, 3] - y_ctr,
-        ],
-        dim=-1,
-    )  # [K, 4]
+    assigned_boxes = gt_boxes[idx_safe]
+    lt = torch.stack([
+        x_ctr - assigned_boxes[:, 0], y_ctr - assigned_boxes[:, 1],
+        assigned_boxes[:, 2] - x_ctr, assigned_boxes[:, 3] - y_ctr,
+    ], dim=-1)
     targets = lt / stride
     targets[~mask] = 0.0
-
     return targets, mask, assigned_idx
 
 
 def decode_boxes(
-    box_preds: torch.Tensor,    # [K, 4] — log [l, t, r, b] (stride-normalised)
-    locations: torch.Tensor,    # [K, 2] — (x_ctr, y_ctr) in px
+    box_preds: torch.Tensor,
+    locations: torch.Tensor,
     stride: float,
     max_size: float = 512.0,
 ) -> torch.Tensor:
-    """Decode log-space [l, t, r, b] predictions to [x1, y1, x2, y2] in px.
-
-    FCOS-style: exp() ensures non-negative distances, then denormalise by stride.
-    """
-    lt_rb = torch.exp(box_preds) * stride  # denormalise, ensure positive
+    lt_rb = torch.exp(box_preds) * stride
     x1 = locations[:, 0] - lt_rb[:, 0]
     y1 = locations[:, 1] - lt_rb[:, 1]
     x2 = locations[:, 0] + lt_rb[:, 2]
     y2 = locations[:, 1] + lt_rb[:, 3]
     boxes = torch.stack([x1, y1, x2, y2], dim=-1)
-
-    # Clamp to image bounds
     boxes[:, 0].clamp_(min=0.0, max=max_size)
     boxes[:, 1].clamp_(min=0.0, max=max_size)
     boxes[:, 2].clamp_(min=0.0, max=max_size)
     boxes[:, 3].clamp_(min=0.0, max=max_size)
     return boxes
+
+
+def compute_centerness_targets(
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    lt, rb = targets[:, :2], targets[:, 2:]
+    lr = torch.cat([lt[:, 0:1], rb[:, 0:1]], dim=-1)
+    tb = torch.cat([lt[:, 1:2], rb[:, 1:2]], dim=-1)
+    left_right = lr.min(dim=-1).values / (lr.max(dim=-1).values + eps)
+    top_bottom = tb.min(dim=-1).values / (tb.max(dim=-1).values + eps)
+    centerness = torch.sqrt(left_right * top_bottom)
+    centerness[~mask] = 0.0
+    return centerness
 
 
 # ---------------------------------------------------------------------------
@@ -160,45 +123,29 @@ def sigmoid_focal_loss(
     gamma: float = 2.0,
     reduction: str = "mean",
 ) -> torch.Tensor:
-    """Sigmoid focal loss for multi-label classification (FCOS-style).
-
-    Args
-    ----
-    inputs:  [N, C]  logits
-    targets: [N, C]  one-hot labels (all zeros = background / ignore)
-    alpha:   class-balancing weight for positive class
-    gamma:   focusing parameter
-    reduction: "mean" (over positive locations) | "sum" | "none"
-    """
     p = inputs.sigmoid()
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     p_t = p * targets + (1.0 - p) * (1.0 - targets)
     loss = ce_loss * ((1.0 - p_t) ** gamma)
-
     if alpha >= 0:
         alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
         loss = alpha_t * loss
-
     if reduction == "mean":
         num_pos = targets.sum()
         if num_pos > 0:
             return loss.sum() / num_pos
-        return loss.sum() * 0.0  # zero gradient when no positives
+        return loss.sum() * 0.0
     elif reduction == "sum":
         return loss.sum()
     return loss
 
 
-def giou_loss(
-    pred_boxes: torch.Tensor,  # [M, 4] decoded [x1,y1,x2,y2]
-    gt_boxes: torch.Tensor,    # [M, 4]
-) -> torch.Tensor:
-    """Generalised IoU loss (1 - GIoU), averaged over the batch dimension."""
+def giou_loss(pred_boxes: torch.Tensor, gt_boxes: torch.Tensor) -> torch.Tensor:
     return generalized_box_iou_loss(pred_boxes, gt_boxes).mean()
 
 
 # ---------------------------------------------------------------------------
-# Detection loss (per-batch)
+# Detection loss (with centerness)
 # ---------------------------------------------------------------------------
 
 def detection_loss(
@@ -209,84 +156,62 @@ def detection_loss(
     focal_alpha: float = 0.25,
     focal_gamma: float = 2.0,
     box_weight: float = 1.0,
+    ctr_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
-    """Compute paper-aligned detection losses for a batch.
-
-    Parameters
-    ----------
-    predictions : dict with keys "class_logits" [B, C, H, W], "boxes" [B, 4, H, W].
-    targets :     list of per-image dicts with "boxes" [N_i, 4] (pixel coords)
-                  and "labels" [N_i] (0-indexed class ids).
-    locations :   [H*W, 2] grid centres in pixel coords.
-    stride :      feature-map stride (image_size / sqrt(num_patches)).
-
-    Returns
-    -------
-    metrics : dict with "det_cls", "det_box", "det_total" tensors.
-    """
-    cls_logits = predictions["class_logits"]   # [B, C, H, W]
-    box_preds = predictions["boxes"]           # [B, 4, H, W]
+    cls_logits = predictions["class_logits"]
+    box_preds = predictions["boxes"]
+    ctr_logits = predictions["centerness"]
 
     B, C, H, W = cls_logits.shape
     K = H * W
     device = cls_logits.device
 
-    cls_losses = []
-    box_losses = []
-    total_pos = 0
+    cls_losses, box_losses, ctr_losses = [], [], []
 
     for b in range(B):
         gt_boxes = targets[b]["boxes"].to(device)
         gt_labels = targets[b]["labels"].to(device)
 
-        # Encode targets ----------------------------------------------------
-        reg_target, pos_mask, assigned_idx = encode_boxes(
-            gt_boxes, locations, stride
-        )
+        reg_target, pos_mask, assigned_idx = encode_boxes(gt_boxes, locations, stride)
 
-        # Classification targets: one-hot at positive locations -------------
         cls_target = torch.zeros(K, C, device=device)
         pos_idx = torch.where(pos_mask)[0]
         if pos_idx.numel() > 0:
             assigned_labels = gt_labels[assigned_idx[pos_idx]]
             cls_target[pos_idx, assigned_labels] = 1.0
 
-        # Flatten predictions ------------------------------------------------
-        cls_pred = cls_logits[b].permute(1, 2, 0).reshape(K, C)   # [K, C]
-        box_pred = box_preds[b].permute(1, 2, 0).reshape(K, 4)    # [K, 4]
+        cls_pred = cls_logits[b].permute(1, 2, 0).reshape(K, C)
+        box_pred = box_preds[b].permute(1, 2, 0).reshape(K, 4)
+        ctr_pred = ctr_logits[b].permute(1, 2, 0).reshape(K)
 
-        # Classification loss (Focal) ---------------------------------------
         cls_loss = sigmoid_focal_loss(
             cls_pred, cls_target, alpha=focal_alpha, gamma=focal_gamma, reduction="mean"
         )
         cls_losses.append(cls_loss)
 
-        # Regression loss (GIoU, positive locations only) -------------------
         n_pos = pos_idx.numel()
         if n_pos > 0:
-            total_pos += n_pos
-            pred_boxes_decoded = decode_boxes(
-                box_pred[pos_idx], locations[pos_idx], stride
-            )
+            pred_boxes_decoded = decode_boxes(box_pred[pos_idx], locations[pos_idx], stride)
             gt_boxes_assigned = gt_boxes[assigned_idx[pos_idx]]
             box_loss = giou_loss(pred_boxes_decoded, gt_boxes_assigned)
             box_losses.append(box_loss)
 
-    # Aggregate -------------------------------------------------------------
+            ctr_target = compute_centerness_targets(reg_target, pos_mask)
+            ctr_loss = F.binary_cross_entropy_with_logits(
+                ctr_pred[pos_idx], ctr_target[pos_idx], reduction="mean"
+            )
+            ctr_losses.append(ctr_loss)
+
     loss_cls = torch.stack(cls_losses).mean() if cls_losses else torch.tensor(0.0, device=device)
     loss_box = torch.stack(box_losses).mean() if box_losses else torch.tensor(0.0, device=device)
+    loss_ctr = torch.stack(ctr_losses).mean() if ctr_losses else torch.tensor(0.0, device=device)
 
-    total = loss_cls + box_weight * loss_box
-
-    return {
-        "det_cls": loss_cls,
-        "det_box": loss_box,
-        "det_total": total,
-    }
+    total = loss_cls + box_weight * loss_box + ctr_weight * loss_ctr
+    return {"det_cls": loss_cls, "det_box": loss_box, "det_ctr": loss_ctr, "det_total": total}
 
 
 # ---------------------------------------------------------------------------
-# Inference: decode → filter → NMS
+# Inference (centerness-weighted scoring)
 # ---------------------------------------------------------------------------
 
 def collect_detections(
@@ -297,41 +222,23 @@ def collect_detections(
     max_detections: int = 196,
     image_size: float = 512.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Decode raw predictions into [x1,y1,x2,y2] boxes with scores and labels.
-
-    Paper-aligned: final score = sigmoid(class_logit).  No centerness term.
-
-    Parameters
-    ----------
-    predictions : dict with "class_logits" [1, C, H, W], "boxes" [1, 4, H, W]
-                  (single image).
-    locations :  [K, 2] grid centres in px.
-    stride :     float.
-    score_threshold : only keep detections above this score.
-    max_detections : maximum number of detections before NMS.
-    image_size :    input image size for box clamping.
-
-    Returns
-    -------
-    boxes  : [D, 4]  — [x1, y1, x2, y2] pixel coords
-    scores : [D]     — sigmoid(class_logit)
-    labels : [D]     — long, class ids
-    """
-    cls_logits = predictions["class_logits"]  # [1, C, H, W]
-    box_preds = predictions["boxes"]          # [1, 4, H, W]
+    cls_logits = predictions["class_logits"]
+    box_preds = predictions["boxes"]
+    ctr_logits = predictions["centerness"]
 
     C = cls_logits.shape[1]
     K = locations.shape[0]
 
-    # Flatten
-    cls_logits = cls_logits[0].permute(1, 2, 0).reshape(K, C)   # [K, C]
-    box_preds = box_preds[0].permute(1, 2, 0).reshape(K, 4)     # [K, 4]
+    cls_logits = cls_logits[0].permute(1, 2, 0).reshape(K, C)
+    box_preds = box_preds[0].permute(1, 2, 0).reshape(K, 4)
+    ctr_preds = ctr_logits[0].permute(1, 2, 0).reshape(K, 1)
 
-    # Paper-aligned: final score is simply sigmoid(class_logit)
-    scores = cls_logits.sigmoid()               # [K, C]
-    max_scores, max_labels = scores.max(dim=1)  # [K], [K]
+    # Centerness-weighted final score
+    cls_probs = cls_logits.sigmoid()
+    ctr_probs = ctr_preds.sigmoid()
+    scores = (cls_probs * ctr_probs).sqrt()
+    max_scores, max_labels = scores.max(dim=1)
 
-    # Filter by score
     keep = max_scores > score_threshold
     if not keep.any():
         return (
@@ -345,22 +252,15 @@ def collect_detections(
     box_preds_kept = box_preds[keep]
     locs = locations[keep]
 
-    # Decode boxes
     boxes = decode_boxes(box_preds_kept, locs, stride, max_size=image_size)
 
-    # Keep top-k by score
     if scores.numel() > max_detections:
         topk = scores.topk(max_detections).indices
-        boxes = boxes[topk]
-        scores = scores[topk]
-        labels = labels[topk]
+        boxes, scores, labels = boxes[topk], scores[topk], labels[topk]
 
-    # Filter invalid boxes (x2 <= x1 or y2 <= y1)
     valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
     if valid.any():
-        boxes = boxes[valid]
-        scores = scores[valid]
-        labels = labels[valid]
+        boxes, scores, labels = boxes[valid], scores[valid], labels[valid]
 
     return boxes, scores, labels
 
@@ -372,7 +272,6 @@ def apply_nms(
     iou_threshold: float = 0.5,
     max_detections: int = 100,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-class batched NMS, then keep top-k overall by score."""
     if boxes.numel() == 0:
         return boxes, scores, labels
     keep = tv_batched_nms(boxes, scores, labels, iou_threshold)
@@ -382,11 +281,10 @@ def apply_nms(
 
 
 # ---------------------------------------------------------------------------
-# mAP computation (VOC 2007 11-point interpolation)
+# mAP (VOC 2007 11-point)
 # ---------------------------------------------------------------------------
 
 def compute_iou(box1: torch.Tensor, box2: torch.Tensor) -> float:
-    """Compute IoU between two boxes (both [x1,y1,x2,y2])."""
     x1 = max(box1[0].item(), box2[0].item())
     y1 = max(box1[1].item(), box2[1].item())
     x2 = min(box1[2].item(), box2[2].item())
@@ -399,20 +297,10 @@ def compute_iou(box1: torch.Tensor, box2: torch.Tensor) -> float:
 
 
 def compute_voc_ap(recalls: list[float], precisions: list[float]) -> float:
-    """VOC 2007 11-point interpolated average precision.
-
-    Sorts by recall, then interpolates precision at 11 recall levels
-    {0, 0.1, ..., 1.0} taking the maximum precision at any recall >= t.
-    """
-    # Pad for interpolation boundary conditions
     recalls = [0.0] + recalls + [1.0]
     precisions = [0.0] + precisions + [0.0]
-
-    # Make precision monotonically decreasing from right
     for i in range(len(precisions) - 2, -1, -1):
         precisions[i] = max(precisions[i], precisions[i + 1])
-
-    # Sample at 11 points
     ap = 0.0
     for t in torch.linspace(0, 1, 11).tolist():
         p_max = 0.0
@@ -420,7 +308,6 @@ def compute_voc_ap(recalls: list[float], precisions: list[float]) -> float:
             if r >= t:
                 p_max = max(p_max, p)
         ap += p_max / 11.0
-
     return ap
 
 
@@ -439,32 +326,10 @@ def evaluate_map(
     image_size: int = 512,
     max_samples: Optional[int] = None,
 ) -> dict[str, float]:
-    """Compute VOC 2007-style mAP@0.5 on a labeled dataset.
-
-    Parameters
-    ----------
-    model :            PROBEModel in eval mode.
-    dataset :          RoadDamageDataset with labels.
-    prototype_state :  PrototypeState.
-    device :           torch device.
-    locations :        [H*W, 2] grid centres in px.
-    stride :           float.
-    num_classes :      number of damage classes.
-    iou_threshold :    IoU threshold for a correct detection (0.5).
-    score_threshold :  minimum score to consider a detection.
-    nms_threshold :    IoU threshold for NMS.
-    image_size :       input image size.
-    max_samples :      cap on number of evaluation images (None = all).
-
-    Returns
-    -------
-    metrics : dict with "mAP@0.5" and per-class "AP_cls_{c}" entries.
-    """
     import torchvision.transforms as T
 
     model.eval()
 
-    # Collect all ground truth and detections per class
     all_gt: dict[int, list[dict]] = {c: [] for c in range(num_classes)}
     all_det: dict[int, list[dict]] = {c: [] for c in range(num_classes)}
 
@@ -477,13 +342,11 @@ def evaluate_map(
         gt_boxes = target["boxes"]
         gt_labels = target["labels"]
 
-        # Register GT per class
         for box, label in zip(gt_boxes, gt_labels):
             c = int(label.item())
             if c < num_classes:
                 all_gt[c].append({"image_id": idx, "box": box, "matched": False})
 
-        # Run detection
         if isinstance(img, torch.Tensor):
             tensor = img.unsqueeze(0).to(device)
         else:
@@ -507,60 +370,43 @@ def evaluate_map(
             c = int(label.item())
             if c < num_classes:
                 all_det[c].append({
-                    "image_id": idx,
-                    "confidence": score.item(),
-                    "box": box.cpu(),
+                    "image_id": idx, "confidence": score.item(), "box": box.cpu(),
                 })
 
-    # Compute per-class AP
     aps = {}
     for c in range(num_classes):
         dets = all_det[c]
         gts = all_gt[c]
-
-        # Sort detections by confidence descending
         dets.sort(key=lambda x: x["confidence"], reverse=True)
-
-        # Reset matched flags
         for gt in gts:
             gt["matched"] = False
 
         tp, fp = [], []
         total_gt = len(gts)
-
         for det in dets:
-            best_iou = 0.0
-            best_gt = None
+            best_iou, best_gt = 0.0, None
             for gt in gts:
                 if gt["image_id"] != det["image_id"] or gt["matched"]:
                     continue
                 iou = compute_iou(det["box"], gt["box"])
                 if iou > best_iou:
-                    best_iou = iou
-                    best_gt = gt
-
+                    best_iou, best_gt = iou, gt
             if best_iou >= iou_threshold and best_gt is not None:
-                tp.append(1)
-                fp.append(0)
+                tp.append(1); fp.append(0)
                 best_gt["matched"] = True
             else:
-                tp.append(0)
-                fp.append(1)
+                tp.append(0); fp.append(1)
 
         if total_gt == 0 and len(dets) == 0:
             aps[f"AP_cls_{c}"] = 0.0
             continue
 
-        # Cumulative precision / recall
         tp_cum = torch.tensor(tp).cumsum(dim=0).tolist() if tp else []
         fp_cum = torch.tensor(fp).cumsum(dim=0).tolist() if fp else []
-
         recalls = [t / max(total_gt, 1) for t in tp_cum]
         precisions = [
-            tp_cum[i] / max(tp_cum[i] + fp_cum[i], 1)
-            for i in range(len(tp_cum))
+            tp_cum[i] / max(tp_cum[i] + fp_cum[i], 1) for i in range(len(tp_cum))
         ]
-
         aps[f"AP_cls_{c}"] = compute_voc_ap(recalls, precisions)
 
     aps["mAP@0.5"] = sum(aps[f"AP_cls_{c}"] for c in range(num_classes)) / num_classes

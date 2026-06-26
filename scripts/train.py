@@ -394,6 +394,7 @@ def train_detection_head(
     focal_alpha = det_cfg.get("focal_alpha", 0.25)
     focal_gamma = det_cfg.get("focal_gamma", 2.0)
     box_weight = det_cfg.get("box_weight", 1.0)
+    ctr_weight = det_cfg.get("ctr_weight", 1.0)
     score_threshold = det_cfg.get("score_threshold", 0.05)
     nms_threshold = det_cfg.get("nms_threshold", 0.5)
     val_interval = det_cfg.get("val_interval", 5)
@@ -406,11 +407,11 @@ def train_detection_head(
 
     best_map = 0.0
     best_epoch = -1
-    history_det: dict[str, list[float]] = {"cls": [], "box": [], "total": [], "mAP": []}
+    history_det: dict[str, list[float]] = {"cls": [], "box": [], "ctr": [], "total": [], "mAP": []}
 
     for epoch in range(total_epochs):
         model.detection_head.train()
-        epoch_losses = {"cls": 0.0, "box": 0.0, "total": 0.0}
+        epoch_losses = {"cls": 0.0, "box": 0.0, "ctr": 0.0, "total": 0.0}
         steps = 0
 
         for images, targets in source_loader:
@@ -426,6 +427,7 @@ def train_detection_head(
                 focal_alpha=focal_alpha,
                 focal_gamma=focal_gamma,
                 box_weight=box_weight,
+                ctr_weight=ctr_weight,
             )
 
             optimizer.zero_grad(set_to_none=True)

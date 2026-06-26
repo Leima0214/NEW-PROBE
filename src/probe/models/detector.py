@@ -17,13 +17,7 @@ class DetectionBatch:
 
 
 class PromptEnhancedViT(nn.Module):
-    """Frozen ViT wrapper with SPEM prompt injection.
-
-    The wrapped ViT is expected to expose standard ViT components:
-    ``patch_embed``, ``cls_token``, ``pos_embed``, ``blocks`` and ``norm``.
-    This keeps the method code independent of a specific timm/torchvision
-    backbone while documenting the exact insertion points used by PROBE.
-    """
+    """Frozen ViT wrapper with SPEM prompt injection."""
 
     def __init__(
         self,
@@ -55,27 +49,18 @@ class PromptEnhancedViT(nn.Module):
         images: torch.Tensor,
         prototype_state: PrototypeState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (tokens, prompts, processed_prompts).
-
-        ``processed_prompts`` are the prompt tokens after they have been
-        updated by transformer attention at the *last* injection layer.
-        These are image-specific (unlike the raw prompts, which are
-        identical across the batch) and enable the InfoNCE prompt
-        consistency loss to actually learn.
-        """
         tokens = self.patchify(images)
         prompts = self.prompt_projector(
             prototype_state.centroids.to(tokens.device),
             batch_size=images.shape[0],
         )
-        processed_prompts = prompts  # fallback if no injection happens
+        processed_prompts = prompts
 
         for layer_id, block in enumerate(self.vit.blocks):
             if self.injector.should_inject(layer_id):
                 K = prompts.shape[1]
                 tokens = self.injector.insert(tokens, prompts)
                 tokens = block(tokens)
-                # Capture the prompt portion AFTER attention updated it
                 processed_prompts = tokens[:, :K, :]
                 tokens = self.injector.remove(tokens, K)
             else:
@@ -95,15 +80,12 @@ class PromptEnhancedViT(nn.Module):
 
 
 class LightweightDetectionHead(nn.Module):
-    """Three-stage detection head described in the PROBE paper (Section 3.5).
+    """FCOS-style detection head with centerness (standard practice).
 
-    Architecture (paper-exact):
-      1. Conv3x3-BN-GELU  → embed_dim → hidden_dim  (384)
-      2. Conv1x1-GELU     → hidden_dim → neck_dim   (128)
-      3. Conv1x1          → neck_dim → num_classes + 4  (cls + [l,t,r,b])
-
-    Reshapes ViT patch tokens into a square feature map and predicts
-    per-cell class logits plus four box-distance parameters.
+    Shared stem (paper-aligned) + three parallel branches:
+      - Classification: C sigmoid logits per location
+      - Box regression: 4 [l, t, r, b] distances per location
+      - Centerness:     1 score per location (suppresses edge boxes)
     """
 
     def __init__(
@@ -116,33 +98,43 @@ class LightweightDetectionHead(nn.Module):
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
-        self.head = nn.Sequential(
+
+        self.stem = nn.Sequential(
             nn.Conv2d(embed_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.GELU(),
+        )
+
+        self.cls_branch = nn.Sequential(
             nn.Conv2d(hidden_dim, neck_dim, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(neck_dim, num_classes + 4, kernel_size=1),
+            nn.Conv2d(neck_dim, num_classes, kernel_size=1),
         )
+        self.box_branch = nn.Sequential(
+            nn.Conv2d(hidden_dim, neck_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(neck_dim, 4, kernel_size=1),
+        )
+        self.ctr_branch = nn.Sequential(
+            nn.Conv2d(hidden_dim, neck_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(neck_dim, 1, kernel_size=1),
+        )
+
         self._init_weights(cls_prior)
 
     def _init_weights(self, cls_prior: float = 0.01) -> None:
-        """Initialize conv weights and set classification bias prior.
-
-        FCOS standard: bias = log(prior/(1-prior)) so that sigmoid(bias) ≈ prior.
-        With cls_prior=0.01, bias ≈ -4.595 — only ~1% of locations fire at init.
-        """
-        for module in self.head:
-            if isinstance(module, nn.Conv2d):
-                nn.init.normal_(module.weight, mean=0.0, std=0.01)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-        # Classification bias: set prior so early training is stable
-        last_conv = self.head[-1]
-        if isinstance(last_conv, nn.Conv2d) and last_conv.bias is not None:
+        for branch in [self.cls_branch, self.box_branch, self.ctr_branch]:
+            last_conv = branch[-1]
+            if isinstance(last_conv, nn.Conv2d):
+                nn.init.normal_(last_conv.weight, mean=0.0, std=0.01)
+                if last_conv.bias is not None:
+                    nn.init.constant_(last_conv.bias, 0.0)
+        # Classification bias prior
+        last_cls = self.cls_branch[-1]
+        if isinstance(last_cls, nn.Conv2d) and last_cls.bias is not None:
             bias_value = math.log(cls_prior / (1.0 - cls_prior))
-            nn.init.constant_(last_conv.bias[: self.num_classes], bias_value)
-            # Box regression bias stays at 0.0
+            nn.init.constant_(last_cls.bias, bias_value)
 
     def forward(self, patch_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
         batch, num_patches, dim = patch_tokens.shape
@@ -150,10 +142,12 @@ class LightweightDetectionHead(nn.Module):
         if side * side != num_patches:
             raise ValueError("Patch tokens must form a square feature map.")
         feature_map = patch_tokens.transpose(1, 2).reshape(batch, dim, side, side)
-        pred = self.head(feature_map)
+
+        shared = self.stem(feature_map)
         return {
-            "class_logits": pred[:, : self.num_classes],
-            "boxes": pred[:, self.num_classes :],
+            "class_logits": self.cls_branch(shared),
+            "boxes": self.box_branch(shared),
+            "centerness": self.ctr_branch(shared),
         }
 
 
