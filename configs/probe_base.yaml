@@ -25,9 +25,10 @@ ssl:
 
 detection:
   num_classes: 5
-  hidden_dim: 384
-  neck_dim: 128
+  hidden_dim: 256
+  head_depth: 3
   source_label_fraction: 0.1
+  cls_prior: 0.1
 
 detection_optim:
   lr: 0.0001
@@ -40,6 +41,7 @@ detection_optim:
   score_threshold: 0.05
   nms_threshold: 0.5
   val_interval: 5
+  center_sampling_radius: 1.5
 
 optim:
   lr: 0.0005

@@ -164,10 +164,12 @@ def train_ssl_pretraining(
         cfg["data"]["source_manifest"],
         cfg["data"]["image_root"],
         transform=eval_transform(image_size),
+        image_size=image_size,
     )
     target_ssl_dataset = RoadDamageDataset(
         cfg["data"]["target_manifest"],
         cfg["data"]["image_root"],
+        image_size=image_size,
     )
 
     batch_size = cfg["data"]["batch_size"]
@@ -350,11 +352,13 @@ def train_detection_head(
         cfg["data"]["source_manifest"],
         cfg["data"]["image_root"],
         transform=eval_transform(image_size),
+        image_size=image_size,
     )
     val_dataset = RoadDamageDataset(
         cfg["data"]["val_manifest"],
         cfg["data"]["image_root"],
         transform=eval_transform(image_size),
+        image_size=image_size,
     )
 
     source_loader = DataLoader(
@@ -375,6 +379,34 @@ def train_detection_head(
     )
 
     print(f"Source: {len(source_dataset)} images  |  Val: {len(val_dataset)} images")
+
+    # --- Label sanity check & class distribution ----------------------------
+    source_label_counts: dict[int, int] = {}
+    source_unique = set()
+    for _, target in source_dataset:
+        for lbl in target["labels"].tolist():
+            source_label_counts[lbl] = source_label_counts.get(lbl, 0) + 1
+            source_unique.add(lbl)
+    val_label_counts: dict[int, int] = {}
+    val_unique = set()
+    for _, target in val_dataset:
+        for lbl in target["labels"].tolist():
+            val_label_counts[lbl] = val_label_counts.get(lbl, 0) + 1
+            val_unique.add(lbl)
+
+    print(f"Source labels: {sorted(source_unique)}  |  Val labels: {sorted(val_unique)}")
+    num_classes = cfg["detection"]["num_classes"]
+    print(f"Per-class GT box counts ({num_classes} classes):")
+    print(f"  {'Class':>6s}  {'Source':>8s}  {'Val':>8s}")
+    for c in range(num_classes):
+        sc = source_label_counts.get(c, 0)
+        vc = val_label_counts.get(c, 0)
+        flag = "  <-- MISSING" if (sc == 0 and vc == 0) else ""
+        print(f"  {c:>6d}  {sc:>8d}  {vc:>8d}{flag}")
+    extra_s = source_unique - set(range(num_classes))
+    extra_v = val_unique - set(range(num_classes))
+    if extra_s or extra_v:
+        print(f"  WARNING: labels outside [0,{num_classes-1}] — source:{sorted(extra_s)} val:{sorted(extra_v)}")
 
     # --- Optimiser (detection head only) ------------------------------------
     det_cfg = cfg.get("detection_optim", {})
@@ -398,12 +430,18 @@ def train_detection_head(
     score_threshold = det_cfg.get("score_threshold", 0.05)
     nms_threshold = det_cfg.get("nms_threshold", 0.5)
     val_interval = det_cfg.get("val_interval", 5)
+    center_sampling_radius = det_cfg.get("center_sampling_radius", 1.5)
     checkpoint_dir = Path(args.checkpoint_dir)
+    grad_accum = args.grad_accum
+    effective_batch = cfg["data"]["batch_size"] * grad_accum
 
     # Freeze backbone
     model.backbone.freeze_backbone()
     for param in model.backbone.parameters():
         param.requires_grad = False
+
+    print(f"Epochs: {total_epochs}  |  batch: {cfg['data']['batch_size']}  |  "
+          f"grad_accum: {grad_accum}  |  effective batch: {effective_batch}")
 
     best_map = 0.0
     best_epoch = -1
@@ -411,31 +449,35 @@ def train_detection_head(
 
     for epoch in range(total_epochs):
         model.detection_head.train()
+        optimizer.zero_grad(set_to_none=True)
         epoch_losses = {"cls": 0.0, "box": 0.0, "ctr": 0.0, "total": 0.0}
         steps = 0
 
-        for images, targets in source_loader:
+        for batch_idx, (images, targets) in enumerate(source_loader):
             images = images.to(device)
 
             # Forward through frozen backbone
             _, patch_tokens, _ = model.encode(images, prototype_state)
             predictions = model.detection_head(patch_tokens)
 
-            # Loss
+            # Loss (scaled for gradient accumulation)
             loss_dict = detection_loss(
                 predictions, targets, locations, stride,
                 focal_alpha=focal_alpha,
                 focal_gamma=focal_gamma,
                 box_weight=box_weight,
                 ctr_weight=ctr_weight,
+                center_sampling_radius=center_sampling_radius,
             )
+            (loss_dict["det_total"] / grad_accum).backward()
 
-            optimizer.zero_grad(set_to_none=True)
-            loss_dict["det_total"].backward()
-            torch.nn.utils.clip_grad_norm_(
-                model.detection_head.parameters(), max_norm=10.0
-            )
-            optimizer.step()
+            # Step only after accumulation window
+            if (batch_idx + 1) % grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.detection_head.parameters(), max_norm=10.0
+                )
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             for k in epoch_losses:
                 epoch_losses[k] += loss_dict[f"det_{k}"].item()
@@ -476,10 +518,13 @@ def train_detection_head(
             mAP = metrics["mAP@0.5"]
             history_det["mAP"].append(mAP)
             class_aps = {k: v for k, v in metrics.items() if k.startswith("AP_cls_")}
-            ap_str = "  ".join(
-                f"c{k.split('_')[-1]}={v:.3f}"
-                for k, v in sorted(class_aps.items())
-            )
+            ap_parts = []
+            for k, v in sorted(class_aps.items()):
+                if v is None:
+                    ap_parts.append(f"c{k.split('_')[-1]}=n/a")
+                else:
+                    ap_parts.append(f"c{k.split('_')[-1]}={v:.3f}")
+            ap_str = "  ".join(ap_parts)
             print(f"  mAP@0.5: {mAP:.4f}  |  {ap_str}")
 
             if mAP > best_map:
@@ -582,8 +627,9 @@ def main() -> None:
     detection_head = LightweightDetectionHead(
         embed_dim=cfg["backbone"]["embed_dim"],
         hidden_dim=cfg["detection"]["hidden_dim"],
-        neck_dim=cfg["detection"]["neck_dim"],
         num_classes=cfg["detection"]["num_classes"],
+        cls_prior=cfg["detection"].get("cls_prior", 0.01),
+        head_depth=cfg["detection"].get("head_depth", 3),
     )
     model = PROBEModel(backbone, detection_head).to(device)
 

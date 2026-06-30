@@ -40,7 +40,14 @@ def encode_boxes(
     gt_boxes: torch.Tensor,
     locations: torch.Tensor,
     stride: float,
+    center_sampling_radius: float = 1.5,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FCOS box encoding with center sampling (standard practice).
+
+    Only grid locations within ``center_sampling_radius * stride`` of a box
+    centre are eligible as positive samples.  This suppresses low-quality
+    edge locations and stabilises training.
+    """
     K = locations.shape[0]
     N = gt_boxes.shape[0]
     if N == 0:
@@ -58,7 +65,22 @@ def encode_boxes(
     r = x2[None, :] - x_ctr[:, None]
     b = y2[None, :] - y_ctr[:, None]
 
-    inside = (l > 0.0) & (t > 0.0) & (r > 0.0) & (b > 0.0)
+    inside_box = (l >= 0.0) & (t >= 0.0) & (r >= 0.0) & (b >= 0.0)
+
+    # Center sampling: restrict to grid cells near box centre
+    if center_sampling_radius > 0:
+        centre_x = (x1 + x2) * 0.5
+        centre_y = (y1 + y2) * 0.5
+        radius = center_sampling_radius * stride
+        in_center = (
+            (x_ctr[:, None] - centre_x[None, :]).abs() < radius
+        ) & (
+            (y_ctr[:, None] - centre_y[None, :]).abs() < radius
+        )
+        inside = inside_box & in_center
+    else:
+        inside = inside_box
+
     areas = (x2 - x1) * (y2 - y1)
     inside_float = inside.float()
     huge = areas.max() + 1.0
@@ -157,6 +179,7 @@ def detection_loss(
     focal_gamma: float = 2.0,
     box_weight: float = 1.0,
     ctr_weight: float = 1.0,
+    center_sampling_radius: float = 1.5,
 ) -> dict[str, torch.Tensor]:
     cls_logits = predictions["class_logits"]
     box_preds = predictions["boxes"]
@@ -166,13 +189,15 @@ def detection_loss(
     K = H * W
     device = cls_logits.device
 
-    cls_losses, box_losses, ctr_losses = [], [], []
+    cls_losses, box_losses, ctr_losses, ctr_neg_losses = [], [], [], []
 
     for b in range(B):
         gt_boxes = targets[b]["boxes"].to(device)
         gt_labels = targets[b]["labels"].to(device)
 
-        reg_target, pos_mask, assigned_idx = encode_boxes(gt_boxes, locations, stride)
+        reg_target, pos_mask, assigned_idx = encode_boxes(
+            gt_boxes, locations, stride, center_sampling_radius=center_sampling_radius
+        )
 
         cls_target = torch.zeros(K, C, device=device)
         pos_idx = torch.where(pos_mask)[0]
@@ -202,11 +227,23 @@ def detection_loss(
             )
             ctr_losses.append(ctr_loss)
 
+        # Centerness negative supervision: push background locations to 0
+        # Applied to EVERY image (not just those with GT boxes) to prevent
+        # centerness noise floor at sigmoid(0)=0.5 from polluting scores.
+        neg_mask = (~pos_mask) if n_pos > 0 else torch.ones(K, dtype=torch.bool, device=device)
+        ctr_loss_neg = F.binary_cross_entropy_with_logits(
+            ctr_pred[neg_mask],
+            torch.zeros(neg_mask.sum(), device=device),
+            reduction="mean",
+        )
+        ctr_neg_losses.append(ctr_loss_neg)
+
     loss_cls = torch.stack(cls_losses).mean() if cls_losses else torch.tensor(0.0, device=device)
     loss_box = torch.stack(box_losses).mean() if box_losses else torch.tensor(0.0, device=device)
     loss_ctr = torch.stack(ctr_losses).mean() if ctr_losses else torch.tensor(0.0, device=device)
+    loss_ctr_neg = torch.stack(ctr_neg_losses).mean() if ctr_neg_losses else torch.tensor(0.0, device=device)
 
-    total = loss_cls + box_weight * loss_box + ctr_weight * loss_ctr
+    total = loss_cls + box_weight * loss_box + ctr_weight * (loss_ctr + 0.5 * loss_ctr_neg)
     return {"det_cls": loss_cls, "det_box": loss_box, "det_ctr": loss_ctr, "det_total": total}
 
 
@@ -233,7 +270,7 @@ def collect_detections(
     box_preds = box_preds[0].permute(1, 2, 0).reshape(K, 4)
     ctr_preds = ctr_logits[0].permute(1, 2, 0).reshape(K, 1)
 
-    # Centerness-weighted final score
+    # Centerness-weighted final score (standard FCOS: sqrt(class_score * centerness))
     cls_probs = cls_logits.sigmoid()
     ctr_probs = ctr_preds.sigmoid()
     scores = (cls_probs * ctr_probs).sqrt()
@@ -374,6 +411,7 @@ def evaluate_map(
                 })
 
     aps = {}
+    classes_with_gt = 0
     for c in range(num_classes):
         dets = all_det[c]
         gts = all_gt[c]
@@ -381,8 +419,18 @@ def evaluate_map(
         for gt in gts:
             gt["matched"] = False
 
-        tp, fp = [], []
         total_gt = len(gts)
+
+        # Skip classes that have no ground-truth in the validation set.
+        # Including them as 0 AP would unfairly penalise mAP when the
+        # dataset simply doesn't contain that damage category.
+        if total_gt == 0:
+            aps[f"AP_cls_{c}"] = None
+            continue
+
+        classes_with_gt += 1
+
+        tp, fp = [], []
         for det in dets:
             best_iou, best_gt = 0.0, None
             for gt in gts:
@@ -397,10 +445,6 @@ def evaluate_map(
             else:
                 tp.append(0); fp.append(1)
 
-        if total_gt == 0 and len(dets) == 0:
-            aps[f"AP_cls_{c}"] = 0.0
-            continue
-
         tp_cum = torch.tensor(tp).cumsum(dim=0).tolist() if tp else []
         fp_cum = torch.tensor(fp).cumsum(dim=0).tolist() if fp else []
         recalls = [t / max(total_gt, 1) for t in tp_cum]
@@ -409,5 +453,7 @@ def evaluate_map(
         ]
         aps[f"AP_cls_{c}"] = compute_voc_ap(recalls, precisions)
 
-    aps["mAP@0.5"] = sum(aps[f"AP_cls_{c}"] for c in range(num_classes)) / num_classes
+    # mAP averaged only over classes that actually appear in the validation set
+    valid_aps = [v for v in aps.values() if v is not None]
+    aps["mAP@0.5"] = sum(valid_aps) / max(len(valid_aps), 1) if valid_aps else 0.0
     return aps
