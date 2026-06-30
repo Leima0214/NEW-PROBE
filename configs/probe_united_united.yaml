@@ -1,3 +1,5 @@
+# Plan B: source=United, val=United (same-domain control)
+# Purpose: verify detection head code works before debugging cross-domain gap
 seed: 42
 device: cuda
 
@@ -25,10 +27,10 @@ ssl:
 
 detection:
   num_classes: 5
-  hidden_dim: 256       # tower width (was general stem dim)
-  head_depth: 3          # conv layers per tower
+  hidden_dim: 256
+  head_depth: 3
   source_label_fraction: 0.1
-  cls_prior: 0.1     # sigmoid(bias) ~ 0.1 at init — less pessimistic for few-shot detection
+  cls_prior: 0.1
 
 detection_optim:
   lr: 0.0003
@@ -50,9 +52,9 @@ optim:
   pretrain_epochs: 100
 
 data:
-  source_manifest: data/Japan_train.jsonl
-  target_manifest: data/Czech_unlabeled.jsonl
-  val_manifest: data/Czech_val_filtered.jsonl
+  source_manifest: data/United_train.jsonl
+  target_manifest: data2/United_States_unlabeled.jsonl
+  val_manifest: data/United_val.jsonl
   image_root: images
   batch_size: 8
   num_workers: 4
