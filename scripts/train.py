@@ -440,8 +440,13 @@ def train_detection_head(
     for param in model.backbone.parameters():
         param.requires_grad = False
 
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    amp_enabled = use_amp and getattr(args, "amp", True)  # --no-amp to disable
+
     print(f"Epochs: {total_epochs}  |  batch: {cfg['data']['batch_size']}  |  "
-          f"grad_accum: {grad_accum}  |  effective batch: {effective_batch}")
+          f"grad_accum: {grad_accum}  |  effective batch: {effective_batch}"
+          f"  |  AMP: {amp_enabled} ({amp_dtype})")
 
     best_map = 0.0
     best_epoch = -1
@@ -456,19 +461,30 @@ def train_detection_head(
         for batch_idx, (images, targets) in enumerate(source_loader):
             images = images.to(device)
 
-            # Forward through frozen backbone
-            _, patch_tokens, _ = model.encode(images, prototype_state)
-            predictions = model.detection_head(patch_tokens)
-
-            # Loss (scaled for gradient accumulation)
-            loss_dict = detection_loss(
-                predictions, targets, locations, stride,
-                focal_alpha=focal_alpha,
-                focal_gamma=focal_gamma,
-                box_weight=box_weight,
-                ctr_weight=ctr_weight,
-                center_sampling_radius=center_sampling_radius,
-            )
+            # Forward through frozen backbone (AMP saves ~30-40% VRAM on 4090)
+            if amp_enabled:
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    _, patch_tokens, _ = model.encode(images, prototype_state)
+                    predictions = model.detection_head(patch_tokens)
+                    loss_dict = detection_loss(
+                        predictions, targets, locations, stride,
+                        focal_alpha=focal_alpha,
+                        focal_gamma=focal_gamma,
+                        box_weight=box_weight,
+                        ctr_weight=ctr_weight,
+                        center_sampling_radius=center_sampling_radius,
+                    )
+            else:
+                _, patch_tokens, _ = model.encode(images, prototype_state)
+                predictions = model.detection_head(patch_tokens)
+                loss_dict = detection_loss(
+                    predictions, targets, locations, stride,
+                    focal_alpha=focal_alpha,
+                    focal_gamma=focal_gamma,
+                    box_weight=box_weight,
+                    ctr_weight=ctr_weight,
+                    center_sampling_radius=center_sampling_radius,
+                )
             (loss_dict["det_total"] / grad_accum).backward()
 
             # Step only after accumulation window
