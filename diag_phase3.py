@@ -53,6 +53,24 @@ model = PROBEModel(backbone, det_head).to(DEVICE)
 
 # Load full model (backbone + detection head if in checkpoint)
 model_state = ckpt["model"]
+det_keys_ckpt = {k for k in model_state if "detection_head" in k}
+det_keys_model = {k for k in model.state_dict() if "detection_head" in k}
+
+print(f"  Detection head keys in checkpoint: {len(det_keys_ckpt)}")
+print(f"  Detection head keys in model:      {len(det_keys_model)}")
+
+# Check shape mismatches
+mismatches = []
+for k in sorted(det_keys_ckpt & det_keys_model):
+    if model_state[k].shape != model.state_dict()[k].shape:
+        mismatches.append(f"    {k}: ckpt={list(model_state[k].shape)} vs model={list(model.state_dict()[k].shape)}")
+if mismatches:
+    print("  SHAPE MISMATCHES:")
+    for m in mismatches[:10]:
+        print(m)
+    if len(mismatches) > 10:
+        print(f"    ... and {len(mismatches)-10} more")
+
 missing, unexpected = model.load_state_dict(model_state, strict=False)
 has_head = any("detection_head" in k for k in model_state)
 print(f"  Loaded (missing: {len(missing)}, unexpected: {len(unexpected)})"
