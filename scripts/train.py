@@ -85,6 +85,17 @@ def eval_transform(image_size: int = 512) -> T.Compose:
     ])
 
 
+def train_transform(image_size: int = 512) -> T.Compose:
+    """Detection training transform with mild augmentation."""
+    return T.Compose([
+        T.Resize((image_size, image_size)),
+        T.RandomHorizontalFlip(p=0.5),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
 def detection_collate(batch: list) -> tuple:
     """Collate variable-size detection targets (boxes/labels differ per image)."""
     images, targets = zip(*batch)
@@ -349,7 +360,7 @@ def train_detection_head(
     source_dataset = RoadDamageDataset(
         cfg["data"]["source_manifest"],
         cfg["data"]["image_root"],
-        transform=eval_transform(image_size),
+        transform=train_transform(image_size),  # augmented for training
         image_size=image_size,
     )
     val_dataset = RoadDamageDataset(
@@ -364,7 +375,7 @@ def train_detection_head(
         batch_size=cfg["data"]["batch_size"],
         shuffle=True,
         num_workers=cfg["data"]["num_workers"],
-        drop_last=True,
+        drop_last=False,  # keep all data, avoid wasting small datasets
         collate_fn=detection_collate,
     )
     val_loader = DataLoader(

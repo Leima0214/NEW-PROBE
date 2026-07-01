@@ -55,7 +55,7 @@ optim:
   pretrain_epochs: 100
 
 data:
-  source_manifest: data/United_train.jsonl       # 改为 United_train.jsonl 按需
+  source_manifest: /PROBE/data/united_states_train.jsonl       # 改为 United_train.jsonl 按需
   target_manifest: /PROBE/data/Czech_unlabeled.jsonl
   val_manifest: /PROBE/data/czech_val.jsonl   # 或 United_val.jsonl
   image_root: /PROBE/data/images
