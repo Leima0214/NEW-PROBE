@@ -188,7 +188,7 @@ def detection_loss(
     K = H * W
     device = cls_logits.device
 
-    cls_losses, box_losses, ctr_losses, ctr_neg_losses = [], [], [], []
+    cls_losses, box_losses, ctr_losses = [], [], []
 
     for b in range(B):
         gt_boxes = targets[b]["boxes"].to(device)
@@ -226,23 +226,13 @@ def detection_loss(
             )
             ctr_losses.append(ctr_loss)
 
-        # Centerness negative supervision: push background locations to 0
-        # Applied to EVERY image (not just those with GT boxes) to prevent
-        # centerness noise floor at sigmoid(0)=0.5 from polluting scores.
-        neg_mask = (~pos_mask) if n_pos > 0 else torch.ones(K, dtype=torch.bool, device=device)
-        ctr_loss_neg = F.binary_cross_entropy_with_logits(
-            ctr_pred[neg_mask],
-            torch.zeros(neg_mask.sum(), device=device),
-            reduction="mean",
-        )
-        ctr_neg_losses.append(ctr_loss_neg)
-
     loss_cls = torch.stack(cls_losses).mean() if cls_losses else torch.tensor(0.0, device=device)
     loss_box = torch.stack(box_losses).mean() if box_losses else torch.tensor(0.0, device=device)
     loss_ctr_pos = torch.stack(ctr_losses).mean() if ctr_losses else torch.tensor(0.0, device=device)
-    loss_ctr_neg = torch.stack(ctr_neg_losses).mean() if ctr_neg_losses else torch.tensor(0.0, device=device)
 
-    loss_ctr = loss_ctr_pos + 0.05 * loss_ctr_neg  # reduced from 0.5 — avoid drowning weak positives
+    # Standard FCOS: centerness is supervised ONLY on positive locations.
+    # No negative-push — background suppression is the classifier's job.
+    loss_ctr = loss_ctr_pos
     total = loss_cls + box_weight * loss_box + ctr_weight * loss_ctr
     return {"det_cls": loss_cls, "det_box": loss_box, "det_ctr": loss_ctr, "det_total": total}
 

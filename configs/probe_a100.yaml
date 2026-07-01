@@ -43,7 +43,7 @@ detection_optim:
   focal_alpha: 0.25
   focal_gamma: 2.0
   box_weight: 1.0
-  ctr_weight: 1.0
+  ctr_weight: 0.3   # centerness pos-only (no neg push), lower weight avoids dominating cls
   score_threshold: 0.005  # lowered from 0.05 — small-domain detection needs permissive gate
   nms_threshold: 0.5
   val_interval: 5
