@@ -1,0 +1,106 @@
+"""Self-diagnostic: evaluate Phase 3 model on its OWN training data.
+
+If mAP on source (same-domain) is near 0, the detection head code has a bug.
+If mAP on source is reasonable (>0.2), the issue is cross-domain features from Phase 2.
+"""
+import sys, yaml, torch, timm
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from probe.models import (PROBEModel, PromptEnhancedViT, PromptProjector,
+                          LightweightDetectionHead, PrototypeState)
+from probe.data.road_damage import RoadDamageDataset
+from probe.engine.detection import (generate_grid, collect_detections,
+                                    apply_nms, evaluate_map)
+import torchvision.transforms as T
+
+DEVICE = torch.device("cuda")
+IMAGE_SIZE = 512
+STRIDE = 16.0
+FEATURE_SIZE = IMAGE_SIZE // 16
+NUM_SAMPLES = 200  # evaluate on first 200 training images
+
+# ── Load config & model ──────────────────────────────────────────
+cfg = yaml.safe_load(open("configs/probe_a100.yaml"))
+
+print("Loading ViT ...")
+vit = timm.create_model(cfg["backbone"]["name"], pretrained=False, img_size=IMAGE_SIZE)
+vit.reset_classifier(0)
+
+print("Loading Phase 2 checkpoint ...")
+ckpt = torch.load("checkpoints/probe_final.pt", map_location=DEVICE, weights_only=False)
+
+prompt_projector = PromptProjector(50, 768, 256)
+backbone = PromptEnhancedViT(vit, prompt_projector, injection_layers=(0, 6))
+
+det_cfg = cfg.get("detection_optim", {})
+use_ctr = det_cfg.get("ctr_weight", 1.0) > 0.0
+det_head = LightweightDetectionHead(
+    768, cfg["detection"]["hidden_dim"],
+    cfg["detection"]["num_classes"],
+    cls_prior=cfg["detection"].get("cls_prior", 0.01),
+    use_centerness=use_ctr,
+)
+model = PROBEModel(backbone, det_head).to(DEVICE)
+
+# Load backbone weights only
+model_state = {k: v for k, v in ckpt["model"].items()
+               if not k.startswith("detection_head.")}
+missing, unexpected = model.load_state_dict(model_state, strict=False)
+print(f"  Loaded backbone (missing: {len(missing)}, unexpected: {len(unexpected)})")
+
+# Load prototype state
+ps = ckpt["prototype_state"]
+if hasattr(ps, "mean"):
+    prototype_state = PrototypeState(ps.mean.to(DEVICE), ps.components.to(DEVICE),
+                                     ps.centroids.to(DEVICE))
+else:
+    prototype_state = PrototypeState(ps["mean"].to(DEVICE), ps["components"].to(DEVICE),
+                                     ps["centroids"].to(DEVICE))
+
+model.eval()
+locations = generate_grid(FEATURE_SIZE, STRIDE, DEVICE)
+
+# ── Evaluate on SOURCE training data ─────────────────────────────
+transform = T.Compose([
+    T.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+print(f"\nEvaluating on source training data ({NUM_SAMPLES} images) ...")
+src_dataset = RoadDamageDataset(
+    cfg["data"]["source_manifest"],
+    cfg["data"]["image_root"],
+    transform=transform, image_size=IMAGE_SIZE,
+)
+
+metrics = evaluate_map(
+    model, src_dataset, prototype_state, DEVICE,
+    locations, STRIDE,
+    num_classes=cfg["detection"]["num_classes"],
+    score_threshold=det_cfg.get("score_threshold", 0.005),
+    nms_threshold=det_cfg.get("nms_threshold", 0.5),
+    image_size=IMAGE_SIZE,
+    max_samples=NUM_SAMPLES,
+    use_centerness=use_ctr,
+)
+
+print(f"\n{'='*60}")
+print(f"SOURCE-DOMAIN mAP@0.5: {metrics['mAP@0.5']:.4f}")
+for k, v in sorted(metrics.items()):
+    if k.startswith("AP_cls_"):
+        label = "n/a" if v is None else f"{v:.4f}"
+        print(f"  {k}: {label}")
+print(f"{'='*60}")
+
+if metrics["mAP@0.5"] < 0.05:
+    print("\n⚠️  mAP < 0.05 on TRAINING data → DETECTION HEAD CODE HAS A BUG")
+    print("   The model cannot detect objects even in its own training domain.")
+elif metrics["mAP@0.5"] < 0.20:
+    print("\n⚠️  mAP 0.05-0.20 on training data → Detection head is weak but functional")
+    print("   Check label assignment, loss weights, or learning rate.")
+else:
+    print("\n✓  mAP > 0.20 on training data → Detection head works correctly")
+    print("   The cross-domain gap (United→Czech) is the real issue.")
+    print("   Switch to Japan→Czech for paper-aligned results.")
