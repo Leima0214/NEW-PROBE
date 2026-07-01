@@ -424,14 +424,27 @@ def train_detection_head(
         lr=det_cfg.get("lr", 1e-4),
         weight_decay=det_cfg.get("weight_decay", 1e-4),
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=det_cfg.get("epochs", 50),
-        eta_min=det_cfg.get("lr_min", 1e-6),
-    )
+    warmup_epochs = det_cfg.get("warmup_epochs", 0)
+    total_epochs = getattr(args, "det_epochs", None) or det_cfg.get("epochs", 50)
+    main_epochs = total_epochs - warmup_epochs
+
+    if warmup_epochs > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, total_iters=warmup_epochs
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=main_epochs, eta_min=det_cfg.get("lr_min", 1e-6),
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine],
+            milestones=[warmup_epochs],
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_epochs, eta_min=det_cfg.get("lr_min", 1e-6),
+        )
 
     # --- Settings -----------------------------------------------------------
-    total_epochs = getattr(args, "det_epochs", None) or det_cfg.get("epochs", 50)
     focal_alpha = det_cfg.get("focal_alpha", 0.25)
     focal_gamma = det_cfg.get("focal_gamma", 2.0)
     box_weight = det_cfg.get("box_weight", 1.0)
@@ -440,6 +453,8 @@ def train_detection_head(
     nms_threshold = det_cfg.get("nms_threshold", 0.5)
     val_interval = det_cfg.get("val_interval", 5)
     center_sampling_radius = det_cfg.get("center_sampling_radius", 1.5)
+    grad_clip = det_cfg.get("grad_clip", 1.0)
+    use_centerness = ctr_weight > 0.0
     checkpoint_dir = Path(args.checkpoint_dir)
     grad_accum = args.grad_accum
     effective_batch = cfg["data"]["batch_size"] * grad_accum
@@ -458,7 +473,8 @@ def train_detection_head(
     print(f"Epochs: {total_epochs}  |  batch: {cfg['data']['batch_size']}  |  "
           f"grad_accum: {grad_accum}  |  effective batch: {effective_batch}"
           f"  |  AMP: {amp_enabled} ({amp_dtype})"
-          f"  |  GradScaler: {scaler.is_enabled()}")
+          f"  |  GradScaler: {scaler.is_enabled()}"
+          f"  |  centerness: {use_centerness}")
 
     # torch.compile on A100 gives ~20% speedup (PyTorch >= 2.0)
     if not args.no_compile and hasattr(torch, "compile"):
@@ -504,7 +520,7 @@ def train_detection_head(
             if (batch_idx + 1) % grad_accum == 0:
                 scaler.unscale_(optimizer)  # needed before clip_grad_norm for fp16
                 torch.nn.utils.clip_grad_norm_(
-                    model.detection_head.parameters(), max_norm=10.0
+                    model.detection_head.parameters(), max_norm=grad_clip
                 )
                 scaler.step(optimizer)
                 scaler.update()
@@ -547,6 +563,7 @@ def train_detection_head(
                 score_threshold=score_threshold,
                 nms_threshold=nms_threshold,
                 image_size=image_size,
+                use_centerness=use_centerness,
             )
             mAP = metrics["mAP@0.5"]
             history_det["mAP"].append(mAP)

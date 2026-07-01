@@ -29,25 +29,27 @@ ssl:
   out_dim: 2048
 
 detection:
-  num_classes: 5
+  num_classes: 4   # paper: 4 road-damage classes (D00-D40, excl. missing class)
   hidden_dim: 256
   head_depth: 3
   source_label_fraction: 0.1
-  cls_prior: 0.1
+  cls_prior: 0.01  # paper-aligned: log(0.01) ≈ -4.595 bias → ~1% positive prior
 
 detection_optim:
-  lr: 0.0003
+  lr: 0.001             # paper: 1e-3 for detection head
   lr_min: 0.000001
   weight_decay: 0.0001
-  epochs: 50
+  epochs: 100            # paper-aligned: 100 epochs
+  warmup_epochs: 5       # linear warmup
+  grad_clip: 1.0         # paper recommendation
   focal_alpha: 0.25
   focal_gamma: 2.0
-  box_weight: 1.0
-  ctr_weight: 0.3   # centerness pos-only (no neg push), lower weight avoids dominating cls
-  score_threshold: 0.005  # lowered from 0.05 — small-domain detection needs permissive gate
+  box_weight: 5.0        # paper: λ_box = 5.0 for GIoU
+  ctr_weight: 0.0        # paper: C+4, no centerness/objectness branch
+  score_threshold: 0.005
   nms_threshold: 0.5
   val_interval: 5
-  center_sampling_radius: 1.5
+  center_sampling_radius: 2.5  # wider radius for road-damage small/long cracks
 
 optim:
   lr: 0.0005

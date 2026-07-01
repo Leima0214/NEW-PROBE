@@ -188,6 +188,7 @@ def detection_loss(
     K = H * W
     device = cls_logits.device
 
+    use_ctr = ctr_weight > 0.0
     cls_losses, box_losses, ctr_losses = [], [], []
 
     for b in range(B):
@@ -206,7 +207,6 @@ def detection_loss(
 
         cls_pred = cls_logits[b].permute(1, 2, 0).reshape(K, C)
         box_pred = box_preds[b].permute(1, 2, 0).reshape(K, 4)
-        ctr_pred = ctr_logits[b].permute(1, 2, 0).reshape(K)
 
         cls_loss = sigmoid_focal_loss(
             cls_pred, cls_target, alpha=focal_alpha, gamma=focal_gamma, reduction="mean"
@@ -220,20 +220,23 @@ def detection_loss(
             box_loss = giou_loss(pred_boxes_decoded, gt_boxes_assigned)
             box_losses.append(box_loss)
 
-            ctr_target = compute_centerness_targets(reg_target, pos_mask)
-            ctr_loss = F.binary_cross_entropy_with_logits(
-                ctr_pred[pos_idx], ctr_target[pos_idx], reduction="mean"
-            )
-            ctr_losses.append(ctr_loss)
+            if use_ctr:
+                ctr_pred = ctr_logits[b].permute(1, 2, 0).reshape(K)
+                ctr_target = compute_centerness_targets(reg_target, pos_mask)
+                ctr_loss = F.binary_cross_entropy_with_logits(
+                    ctr_pred[pos_idx], ctr_target[pos_idx], reduction="mean"
+                )
+                ctr_losses.append(ctr_loss)
 
     loss_cls = torch.stack(cls_losses).mean() if cls_losses else torch.tensor(0.0, device=device)
     loss_box = torch.stack(box_losses).mean() if box_losses else torch.tensor(0.0, device=device)
-    loss_ctr_pos = torch.stack(ctr_losses).mean() if ctr_losses else torch.tensor(0.0, device=device)
-
-    # Standard FCOS: centerness is supervised ONLY on positive locations.
-    # No negative-push — background suppression is the classifier's job.
+    loss_ctr_pos = (torch.stack(ctr_losses).mean()
+                     if (use_ctr and ctr_losses)
+                     else torch.tensor(0.0, device=device))
     loss_ctr = loss_ctr_pos
-    total = loss_cls + box_weight * loss_box + ctr_weight * loss_ctr
+    total = loss_cls + box_weight * loss_box
+    if use_ctr:
+        total = total + ctr_weight * loss_ctr
     return {"det_cls": loss_cls, "det_box": loss_box, "det_ctr": loss_ctr, "det_total": total}
 
 
@@ -248,29 +251,34 @@ def collect_detections(
     score_threshold: float = 0.05,
     max_detections: int = 196,
     image_size: float = 512.0,
+    use_centerness: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     cls_logits = predictions["class_logits"]
     box_preds = predictions["boxes"]
-    ctr_logits = predictions["centerness"]
 
     C = cls_logits.shape[1]
     K = locations.shape[0]
 
     cls_logits = cls_logits[0].permute(1, 2, 0).reshape(K, C)
     box_preds = box_preds[0].permute(1, 2, 0).reshape(K, 4)
-    ctr_preds = ctr_logits[0].permute(1, 2, 0).reshape(K, 1)
 
-    # Centerness-weighted final score (standard FCOS: sqrt(class_score * centerness))
     cls_probs = cls_logits.sigmoid()
-    ctr_probs = ctr_preds.sigmoid()
-    scores = (cls_probs * ctr_probs).sqrt()
+
+    if use_centerness and "centerness" in predictions:
+        ctr_logits = predictions["centerness"]
+        ctr_preds = ctr_logits[0].permute(1, 2, 0).reshape(K, 1)
+        ctr_probs = ctr_preds.sigmoid()
+        scores = (cls_probs * ctr_probs).sqrt()  # FCOS: sqrt(cls * ctr)
+    else:
+        # Paper-aligned: C+4, no centerness — score = class confidence
+        scores = cls_probs
+
     max_scores, max_labels = scores.max(dim=1)
 
     keep = max_scores > score_threshold
     if not keep.any():
         import sys
         print(f"  [diag] max_cls={cls_probs.max().item():.4f}  "
-              f"max_ctr={ctr_probs.max().item():.4f}  "
               f"max_score={max_scores.max().item():.4f}  "
               f"threshold={score_threshold}  → ALL FILTERED",
               file=sys.stderr, flush=True)
@@ -364,6 +372,7 @@ def evaluate_map(
     nms_threshold: float = 0.5,
     image_size: int = 512,
     max_samples: Optional[int] = None,
+    use_centerness: bool = False,
 ) -> dict[str, float]:
     import torchvision.transforms as T
 
@@ -400,6 +409,7 @@ def evaluate_map(
         det_boxes, det_scores, det_labels = collect_detections(
             predictions, locations, stride,
             score_threshold=score_threshold, image_size=image_size,
+            use_centerness=use_centerness,
         )
         det_boxes, det_scores, det_labels = apply_nms(
             det_boxes, det_scores, det_labels, iou_threshold=nms_threshold,
