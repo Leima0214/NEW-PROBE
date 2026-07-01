@@ -204,7 +204,13 @@ def train_ssl_pretraining(
 
     total_epochs = getattr(args, "epochs", None) or cfg["optim"]["pretrain_epochs"]
     grad_accum = args.grad_accum
+
+    # AMP setup (same pattern as Phase 3)
     use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    amp_enabled = use_amp and not args.no_amp
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_enabled and amp_dtype == torch.float16))
+
     ssl_aug = simsiam_transform(image_size)
     prompt_weight = cfg["spem"]["prompt_weight"]
     dapa_weight = cfg["dapa"]["weight"]
@@ -238,18 +244,7 @@ def train_ssl_pretraining(
             target_view1 = torch.stack([ssl_aug(img) for img in target_imgs]).to(device)
             target_view2 = torch.stack([ssl_aug(img) for img in target_imgs]).to(device)
 
-            if use_amp:
-                with torch.amp.autocast("cuda"):
-                    metrics = probe_pretrain_step(
-                        model, ssl_heads, alignment_head,
-                        source_images, target_view1, target_view2,
-                        prototype_state, optimizer,
-                        prompt_weight=prompt_weight,
-                        dapa_weight=dapa_weight,
-                        prompt_temperature=prompt_temperature,
-                        grad_accum=grad_accum,
-                    )
-            else:
+            with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 metrics = probe_pretrain_step(
                     model, ssl_heads, alignment_head,
                     source_images, target_view1, target_view2,
@@ -258,11 +253,14 @@ def train_ssl_pretraining(
                     dapa_weight=dapa_weight,
                     prompt_temperature=prompt_temperature,
                     grad_accum=grad_accum,
+                    scaler=scaler,
                 )
 
             # Step after accumulation window
             if (step + 1) % grad_accum == 0:
+                scaler.unscale_(optimizer)
                 optimizer.step()
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
             for k in epoch_losses:
@@ -441,12 +439,25 @@ def train_detection_head(
         param.requires_grad = False
 
     use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    amp_enabled = use_amp and getattr(args, "amp", True)  # --no-amp to disable
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    amp_enabled = use_amp and not args.no_amp
+    # GradScaler only needed for fp16; bf16 has enough dynamic range
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_enabled and amp_dtype == torch.float16))
 
     print(f"Epochs: {total_epochs}  |  batch: {cfg['data']['batch_size']}  |  "
           f"grad_accum: {grad_accum}  |  effective batch: {effective_batch}"
-          f"  |  AMP: {amp_enabled} ({amp_dtype})")
+          f"  |  AMP: {amp_enabled} ({amp_dtype})"
+          f"  |  GradScaler: {scaler.is_enabled()}")
+
+    # torch.compile on A100 gives ~20% speedup (PyTorch >= 2.0)
+    if not args.no_compile and hasattr(torch, "compile"):
+        try:
+            model.detection_head = torch.compile(
+                model.detection_head, mode="reduce-overhead"
+            )
+            print("  torch.compile: enabled (reduce-overhead)")
+        except Exception as e:
+            print(f"  torch.compile: skipped ({e})")
 
     best_map = 0.0
     best_epoch = -1
@@ -461,20 +472,8 @@ def train_detection_head(
         for batch_idx, (images, targets) in enumerate(source_loader):
             images = images.to(device)
 
-            # Forward through frozen backbone (AMP saves ~30-40% VRAM on 4090)
-            if amp_enabled:
-                with torch.amp.autocast("cuda", dtype=amp_dtype):
-                    _, patch_tokens, _ = model.encode(images, prototype_state)
-                    predictions = model.detection_head(patch_tokens)
-                    loss_dict = detection_loss(
-                        predictions, targets, locations, stride,
-                        focal_alpha=focal_alpha,
-                        focal_gamma=focal_gamma,
-                        box_weight=box_weight,
-                        ctr_weight=ctr_weight,
-                        center_sampling_radius=center_sampling_radius,
-                    )
-            else:
+            # Forward through frozen backbone
+            with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 _, patch_tokens, _ = model.encode(images, prototype_state)
                 predictions = model.detection_head(patch_tokens)
                 loss_dict = detection_loss(
@@ -485,14 +484,19 @@ def train_detection_head(
                     ctr_weight=ctr_weight,
                     center_sampling_radius=center_sampling_radius,
                 )
-            (loss_dict["det_total"] / grad_accum).backward()
+                scaled_loss = loss_dict["det_total"] / grad_accum
+
+            # Backward (through GradScaler when fp16, direct when bf16/fp32)
+            scaler.scale(scaled_loss).backward()
 
             # Step only after accumulation window
             if (batch_idx + 1) % grad_accum == 0:
+                scaler.unscale_(optimizer)  # needed before clip_grad_norm for fp16
                 torch.nn.utils.clip_grad_norm_(
                     model.detection_head.parameters(), max_norm=10.0
                 )
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
             for k in epoch_losses:
@@ -504,6 +508,7 @@ def train_detection_head(
                     f"  epoch {epoch:3d} step {steps:4d} | "
                     f"cls {loss_dict['det_cls'].item():.4f}  "
                     f"box {loss_dict['det_box'].item():.4f}  "
+                    f"ctr {loss_dict['det_ctr'].item():.4f}  "
                     f"total {loss_dict['det_total'].item():.4f}"
                 )
 
@@ -516,7 +521,8 @@ def train_detection_head(
         print(
             f"Epoch {epoch:3d} avg | "
             f"cls {avg['cls']:.4f}  box {avg['box']:.4f}  "
-            f"total {avg['total']:.4f}  lr {scheduler.get_last_lr()[0]:.2e}"
+            f"ctr {avg['ctr']:.4f}  total {avg['total']:.4f}  "
+            f"lr {scheduler.get_last_lr()[0]:.2e}"
         )
 
         # Validation
@@ -597,6 +603,10 @@ def main() -> None:
                         help="Override batch_size from config")
     parser.add_argument("--grad-accum", type=int, default=1,
                         help="Gradient accumulation steps (simulates larger batch)")
+    parser.add_argument("--no-amp", action="store_true", default=False,
+                        help="Disable AMP (useful for debugging or older GPUs)")
+    parser.add_argument("--no-compile", action="store_true", default=False,
+                        help="Disable torch.compile (A100: ~20 pct speedup when enabled)")
     parser.add_argument(
         "--phase", type=int, choices=[1, 2, 3], default=None,
         help="Run only a specific phase "

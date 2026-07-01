@@ -54,7 +54,7 @@ def encode_boxes(
         return (
             torch.zeros(K, 4, device=locations.device),
             torch.zeros(K, dtype=torch.bool, device=locations.device),
-            torch.full((K,), -1, dtype=torch.int64, device=locations.device),
+            torch.zeros(K, dtype=torch.int64, device=locations.device),  # safe fallback
         )
 
     x_ctr, y_ctr = locations[:, 0], locations[:, 1]
@@ -68,15 +68,14 @@ def encode_boxes(
     inside_box = (l >= 0.0) & (t >= 0.0) & (r >= 0.0) & (b >= 0.0)
 
     # Center sampling: restrict to grid cells near box centre
+    # Uses L2 (circular) radius — standard FCOS practice
     if center_sampling_radius > 0:
         centre_x = (x1 + x2) * 0.5
         centre_y = (y1 + y2) * 0.5
         radius = center_sampling_radius * stride
-        in_center = (
-            (x_ctr[:, None] - centre_x[None, :]).abs() < radius
-        ) & (
-            (y_ctr[:, None] - centre_y[None, :]).abs() < radius
-        )
+        dx = x_ctr[:, None] - centre_x[None, :]
+        dy = y_ctr[:, None] - centre_y[None, :]
+        in_center = (dx * dx + dy * dy) < (radius * radius)
         inside = inside_box & in_center
     else:
         inside = inside_box
@@ -240,10 +239,11 @@ def detection_loss(
 
     loss_cls = torch.stack(cls_losses).mean() if cls_losses else torch.tensor(0.0, device=device)
     loss_box = torch.stack(box_losses).mean() if box_losses else torch.tensor(0.0, device=device)
-    loss_ctr = torch.stack(ctr_losses).mean() if ctr_losses else torch.tensor(0.0, device=device)
+    loss_ctr_pos = torch.stack(ctr_losses).mean() if ctr_losses else torch.tensor(0.0, device=device)
     loss_ctr_neg = torch.stack(ctr_neg_losses).mean() if ctr_neg_losses else torch.tensor(0.0, device=device)
 
-    total = loss_cls + box_weight * loss_box + ctr_weight * (loss_ctr + 0.5 * loss_ctr_neg)
+    loss_ctr = loss_ctr_pos + 0.5 * loss_ctr_neg  # full centerness loss (pos + 0.5×neg)
+    total = loss_cls + box_weight * loss_box + ctr_weight * loss_ctr
     return {"det_cls": loss_cls, "det_box": loss_box, "det_ctr": loss_ctr, "det_total": total}
 
 
@@ -298,6 +298,12 @@ def collect_detections(
     valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
     if valid.any():
         boxes, scores, labels = boxes[valid], scores[valid], labels[valid]
+    else:
+        return (
+            torch.zeros(0, 4, device=cls_logits.device),
+            torch.zeros(0, device=cls_logits.device),
+            torch.zeros(0, dtype=torch.long, device=cls_logits.device),
+        )
 
     return boxes, scores, labels
 

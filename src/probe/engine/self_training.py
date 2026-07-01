@@ -92,6 +92,7 @@ def probe_pretrain_step(
     dapa_weight: float = 0.5,
     prompt_temperature: float = 0.2,
     grad_accum: int = 1,
+    scaler=None,
 ) -> dict[str, float]:
     """One paper-aligned PROBE pre-training step (Eq. 7 in the paper).
 
@@ -101,6 +102,8 @@ def probe_pretrain_step(
     When grad_accum > 1, loss is scaled by 1/grad_accum and only backward()
     is performed; the caller is responsible for calling optimizer.step() and
     optimizer.zero_grad() after the accumulation window.
+
+    When scaler is provided (fp16 AMP), backward goes through GradScaler.
     """
 
     source_features, _, _ = model.encode(source_images, prototype_state)
@@ -116,7 +119,10 @@ def probe_pretrain_step(
     loss = loss_ssl + prompt_weight * loss_prompt + dapa_weight * loss_dapa
     loss = loss / grad_accum
 
-    loss.backward()
+    if scaler is not None:
+        scaler.scale(loss).backward()
+    else:
+        loss.backward()
 
     return {
         "loss": float((loss * grad_accum).detach().cpu()),
