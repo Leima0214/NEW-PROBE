@@ -182,13 +182,13 @@ def detection_loss(
 ) -> dict[str, torch.Tensor]:
     cls_logits = predictions["class_logits"]
     box_preds = predictions["boxes"]
-    ctr_logits = predictions["centerness"]
 
     B, C, H, W = cls_logits.shape
     K = H * W
     device = cls_logits.device
 
     use_ctr = ctr_weight > 0.0
+    ctr_logits = predictions.get("centerness") if use_ctr else None
     cls_losses, box_losses, ctr_losses = [], [], []
 
     for b in range(B):
