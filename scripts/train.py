@@ -96,6 +96,11 @@ def train_transform(image_size: int = 512) -> T.Compose:
     ])
 
 
+def _unwrap_state_dict(state_dict: dict) -> dict:
+    """Strip _orig_mod. prefix injected by torch.compile."""
+    return {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+
 def detection_collate(batch: list) -> tuple:
     """Collate variable-size detection targets (boxes/labels differ per image)."""
     images, targets = zip(*batch)
@@ -300,7 +305,7 @@ def train_ssl_pretraining(
             ckpt_path = checkpoint_dir / f"probe_epoch{epoch + 1:03d}.pt"
             torch.save({
                 "epoch": epoch,
-                "model": model.state_dict(),
+                "model": _unwrap_state_dict(model.state_dict()),
                 "ssl_heads": ssl_heads.state_dict(),
                 "alignment_head": alignment_head.state_dict(),
                 "prototype_state": prototype_state,
@@ -312,7 +317,7 @@ def train_ssl_pretraining(
     final_path = checkpoint_dir / "probe_final.pt"
     torch.save({
         "epoch": total_epochs,
-        "model": model.state_dict(),
+        "model": _unwrap_state_dict(model.state_dict()),
         "ssl_heads": ssl_heads.state_dict(),
         "alignment_head": alignment_head.state_dict(),
         "prototype_state": prototype_state,
@@ -583,7 +588,7 @@ def train_detection_head(
                 best_path = checkpoint_dir / "probe_det_best.pt"
                 torch.save({
                     "epoch": epoch,
-                    "model": model.state_dict(),
+                    "model": _unwrap_state_dict(model.state_dict()),
                     "detection_head": model.detection_head.state_dict(),
                     "prototype_state": prototype_state,
                     "optimizer": optimizer.state_dict(),
@@ -596,7 +601,7 @@ def train_detection_head(
     final_path = checkpoint_dir / "probe_det_final.pt"
     torch.save({
         "epoch": total_epochs - 1,
-        "model": model.state_dict(),
+        "model": _unwrap_state_dict(model.state_dict()),
         "detection_head": model.detection_head.state_dict(),
         "prototype_state": prototype_state,
         "best_mAP": best_map,
@@ -705,6 +710,8 @@ def main() -> None:
 
         # Load backbone weights only (skip detection head if present)
         model_state = ckpt["model"]
+        # Also strip _orig_mod. prefix from torch.compile-wrapped checkpoints
+        model_state = {k.replace("_orig_mod.", ""): v for k, v in model_state.items()}
         filtered_state = {
             k: v for k, v in model_state.items()
             if not k.startswith("detection_head.")

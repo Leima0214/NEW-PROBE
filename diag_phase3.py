@@ -52,7 +52,8 @@ det_head = LightweightDetectionHead(
 model = PROBEModel(backbone, det_head).to(DEVICE)
 
 # Load full model (backbone + detection head if in checkpoint)
-model_state = ckpt["model"]
+# Strip _orig_mod. prefix from torch.compile-wrapped checkpoints
+model_state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
 det_keys_ckpt = {k for k in model_state if "detection_head" in k}
 det_keys_model = {k for k in model.state_dict() if "detection_head" in k}
 
