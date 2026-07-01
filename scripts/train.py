@@ -678,12 +678,14 @@ def main() -> None:
         vit, prompt_projector,
         injection_layers=tuple(cfg["spem"]["injection_layers"]),
     )
+    det_use_ctr = cfg.get("detection_optim", {}).get("ctr_weight", 1.0) > 0.0
     detection_head = LightweightDetectionHead(
         embed_dim=cfg["backbone"]["embed_dim"],
         hidden_dim=cfg["detection"]["hidden_dim"],
         num_classes=cfg["detection"]["num_classes"],
         cls_prior=cfg["detection"].get("cls_prior", 0.01),
         head_depth=cfg["detection"].get("head_depth", 3),
+        use_centerness=det_use_ctr,
     )
     model = PROBEModel(backbone, detection_head).to(device)
 

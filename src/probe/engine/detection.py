@@ -105,7 +105,7 @@ def decode_boxes(
     stride: float,
     max_size: float = 512.0,
 ) -> torch.Tensor:
-    lt_rb = torch.exp(box_preds) * stride
+    lt_rb = F.softplus(box_preds) * stride  # softplus more stable than exp for small values
     x1 = locations[:, 0] - lt_rb[:, 0]
     y1 = locations[:, 1] - lt_rb[:, 1]
     x2 = locations[:, 0] + lt_rb[:, 2]
