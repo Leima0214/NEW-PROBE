@@ -242,7 +242,7 @@ def detection_loss(
     loss_ctr_pos = torch.stack(ctr_losses).mean() if ctr_losses else torch.tensor(0.0, device=device)
     loss_ctr_neg = torch.stack(ctr_neg_losses).mean() if ctr_neg_losses else torch.tensor(0.0, device=device)
 
-    loss_ctr = loss_ctr_pos + 0.5 * loss_ctr_neg  # full centerness loss (pos + 0.5×neg)
+    loss_ctr = loss_ctr_pos + 0.05 * loss_ctr_neg  # reduced from 0.5 — avoid drowning weak positives
     total = loss_cls + box_weight * loss_box + ctr_weight * loss_ctr
     return {"det_cls": loss_cls, "det_box": loss_box, "det_ctr": loss_ctr, "det_total": total}
 
@@ -278,6 +278,12 @@ def collect_detections(
 
     keep = max_scores > score_threshold
     if not keep.any():
+        import sys
+        print(f"  [diag] max_cls={cls_probs.max().item():.4f}  "
+              f"max_ctr={ctr_probs.max().item():.4f}  "
+              f"max_score={max_scores.max().item():.4f}  "
+              f"threshold={score_threshold}  → ALL FILTERED",
+              file=sys.stderr, flush=True)
         return (
             torch.zeros(0, 4, device=cls_logits.device),
             torch.zeros(0, device=cls_logits.device),

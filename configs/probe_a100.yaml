@@ -44,7 +44,7 @@ detection_optim:
   focal_gamma: 2.0
   box_weight: 1.0
   ctr_weight: 1.0
-  score_threshold: 0.05
+  score_threshold: 0.005  # lowered from 0.05 — small-domain detection needs permissive gate
   nms_threshold: 0.5
   val_interval: 5
   center_sampling_radius: 1.5
