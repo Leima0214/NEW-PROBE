@@ -29,7 +29,14 @@ vit = timm.create_model(cfg["backbone"]["name"], pretrained=False, img_size=IMAG
 vit.reset_classifier(0)
 
 print("Loading Phase 2 checkpoint ...")
-ckpt = torch.load(ROOT / "checkpoints/probe_final.pt", map_location=DEVICE, weights_only=False)
+# Try Phase 3 checkpoint first (trained head), fall back to Phase 2
+det_ckpt_path = ROOT / "checkpoints/probe_det_best.pt"
+if det_ckpt_path.exists():
+    ckpt = torch.load(det_ckpt_path, map_location=DEVICE, weights_only=False)
+    print(f"Loading Phase 3 detection checkpoint: {det_ckpt_path}")
+else:
+    ckpt = torch.load(ROOT / "checkpoints/probe_final.pt", map_location=DEVICE, weights_only=False)
+    print("Loading Phase 2 checkpoint (detection head will be UNTRAINED!)")
 
 prompt_projector = PromptProjector(50, 768, 256)
 backbone = PromptEnhancedViT(vit, prompt_projector, injection_layers=(0, 6))
@@ -44,11 +51,12 @@ det_head = LightweightDetectionHead(
 )
 model = PROBEModel(backbone, det_head).to(DEVICE)
 
-# Load backbone weights only
-model_state = {k: v for k, v in ckpt["model"].items()
-               if not k.startswith("detection_head.")}
+# Load full model (backbone + detection head if in checkpoint)
+model_state = ckpt["model"]
 missing, unexpected = model.load_state_dict(model_state, strict=False)
-print(f"  Loaded backbone (missing: {len(missing)}, unexpected: {len(unexpected)})")
+has_head = any("detection_head" in k for k in model_state)
+print(f"  Loaded (missing: {len(missing)}, unexpected: {len(unexpected)})"
+      f"  |  head_in_ckpt: {has_head}")
 
 # Load prototype state
 ps = ckpt["prototype_state"]
