@@ -5,7 +5,8 @@ If mAP on source is reasonable (>0.2), the issue is cross-domain features from P
 """
 import sys, yaml, torch, timm
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "src"))
 
 from probe.models import (PROBEModel, PromptEnhancedViT, PromptProjector,
                           LightweightDetectionHead, PrototypeState)
@@ -21,14 +22,14 @@ FEATURE_SIZE = IMAGE_SIZE // 16
 NUM_SAMPLES = 200  # evaluate on first 200 training images
 
 # ── Load config & model ──────────────────────────────────────────
-cfg = yaml.safe_load(open("configs/probe_a100.yaml"))
+cfg = yaml.safe_load(open(ROOT / "configs/probe_a100.yaml"))
 
 print("Loading ViT ...")
 vit = timm.create_model(cfg["backbone"]["name"], pretrained=False, img_size=IMAGE_SIZE)
 vit.reset_classifier(0)
 
 print("Loading Phase 2 checkpoint ...")
-ckpt = torch.load("checkpoints/probe_final.pt", map_location=DEVICE, weights_only=False)
+ckpt = torch.load(ROOT / "checkpoints/probe_final.pt", map_location=DEVICE, weights_only=False)
 
 prompt_projector = PromptProjector(50, 768, 256)
 backbone = PromptEnhancedViT(vit, prompt_projector, injection_layers=(0, 6))
@@ -51,12 +52,13 @@ print(f"  Loaded backbone (missing: {len(missing)}, unexpected: {len(unexpected)
 
 # Load prototype state
 ps = ckpt["prototype_state"]
-if hasattr(ps, "mean"):
-    prototype_state = PrototypeState(ps.mean.to(DEVICE), ps.components.to(DEVICE),
-                                     ps.centroids.to(DEVICE))
-else:
+if isinstance(ps, dict):
+    # legacy dict format
     prototype_state = PrototypeState(ps["mean"].to(DEVICE), ps["components"].to(DEVICE),
                                      ps["centroids"].to(DEVICE))
+else:
+    prototype_state = PrototypeState(ps.mean.to(DEVICE), ps.components.to(DEVICE),
+                                     ps.centroids.to(DEVICE))
 
 model.eval()
 locations = generate_grid(FEATURE_SIZE, STRIDE, DEVICE)
