@@ -96,9 +96,11 @@ class LightweightDetectionHead(nn.Module):
         cls_prior: float = 0.01,
         head_depth: int = 3,
         num_groups: int = 8,
+        use_centerness: bool = False,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
+        self.use_centerness = use_centerness
 
         # --- Classification tower -------------------------------------------
         cls_layers: list[nn.Module] = []
@@ -127,7 +129,10 @@ class LightweightDetectionHead(nn.Module):
             in_dim = out_dim
         self.reg_tower = nn.Sequential(*reg_layers)
         self.box_logits = nn.Conv2d(hidden_dim, 4, kernel_size=3, padding=1)
-        self.ctr_logits = nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
+        if use_centerness:
+            self.ctr_logits = nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
+        else:
+            self.ctr_logits = None  # paper-aligned: C+4, no centerness
 
         self._init_weights(cls_prior)
 
@@ -137,10 +142,15 @@ class LightweightDetectionHead(nn.Module):
                 if isinstance(m, nn.Conv2d):
                     nn.init.normal_(m.weight, mean=0.0, std=0.01)
         # Final projection layers
-        for conv in [self.cls_logits, self.box_logits, self.ctr_logits]:
-            nn.init.normal_(conv.weight, mean=0.0, std=0.01)
-            if conv.bias is not None:
-                nn.init.constant_(conv.bias, 0.0)
+        for conv in [self.cls_logits, self.box_logits]:
+            if conv is not None:
+                nn.init.normal_(conv.weight, mean=0.0, std=0.01)
+                if conv.bias is not None:
+                    nn.init.constant_(conv.bias, 0.0)
+        if self.ctr_logits is not None:
+            nn.init.normal_(self.ctr_logits.weight, mean=0.0, std=0.01)
+            if self.ctr_logits.bias is not None:
+                nn.init.constant_(self.ctr_logits.bias, 0.0)
         # Classification bias prior (focal-loss "prior" trick)
         bias_value = math.log(cls_prior / (1.0 - cls_prior))
         nn.init.constant_(self.cls_logits.bias, bias_value)
@@ -152,11 +162,13 @@ class LightweightDetectionHead(nn.Module):
             raise ValueError("Patch tokens must form a square feature map.")
         feature_map = patch_tokens.transpose(1, 2).reshape(batch, dim, side, side)
 
-        return {
+        out = {
             "class_logits": self.cls_logits(self.cls_tower(feature_map)),
             "boxes": self.box_logits(self.reg_tower(feature_map)),
-            "centerness": self.ctr_logits(self.reg_tower(feature_map)),
         }
+        if self.use_centerness and self.ctr_logits is not None:
+            out["centerness"] = self.ctr_logits(self.reg_tower(feature_map))
+        return out
 
 
 class PROBEModel(nn.Module):
