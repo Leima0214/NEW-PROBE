@@ -80,12 +80,12 @@ class PromptEnhancedViT(nn.Module):
 
 
 class LightweightDetectionHead(nn.Module):
-    """FCOS detection head with separate classification and regression towers.
+    """Lightweight dense detector over the final ViT patch feature map.
 
-    Standard FCOS practice: each tower is a stack of 3×3 convolutions with
-    GroupNorm (more stable than BatchNorm for cross-domain settings).
-    The classification tower outputs C sigmoid logits per location; the
-    regression tower is shared by the box (4-d) and centerness (1-d) branches.
+    ``architecture="paper"`` implements Section 3.5 exactly at the module
+    level: 3x3 Conv-BN-GELU (768->384), 1x1 Conv-GELU (384->128), then a
+    1x1 C+4 prediction layer. ``architecture="fcos"`` retains the earlier
+    two-tower implementation for controlled ablations and old experiments.
     """
 
     def __init__(
@@ -97,10 +97,46 @@ class LightweightDetectionHead(nn.Module):
         head_depth: int = 3,
         num_groups: int = 8,
         use_centerness: bool = False,
+        architecture: str = "paper",
+        paper_mid_dim: int = 384,
+        paper_neck_dim: int = 128,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.use_centerness = use_centerness
+        self.architecture = architecture
+
+        if architecture not in {"paper", "fcos"}:
+            raise ValueError(f"Unknown detection head architecture: {architecture}")
+        if architecture == "paper" and use_centerness:
+            raise ValueError("The paper C+4 detection head does not use centerness.")
+
+        if architecture == "paper":
+            self.shared_head = nn.Sequential(
+                nn.Conv2d(
+                    embed_dim,
+                    paper_mid_dim,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(paper_mid_dim),
+                nn.GELU(),
+                nn.Conv2d(paper_mid_dim, paper_neck_dim, kernel_size=1),
+                nn.GELU(),
+            )
+            self.prediction = nn.Conv2d(
+                paper_neck_dim,
+                num_classes + 4,
+                kernel_size=1,
+            )
+            self.cls_tower = None
+            self.reg_tower = None
+            self.cls_logits = None
+            self.box_logits = None
+            self.ctr_logits = None
+            self._init_weights(cls_prior)
+            return
 
         # --- Classification tower -------------------------------------------
         cls_layers: list[nn.Module] = []
@@ -137,6 +173,19 @@ class LightweightDetectionHead(nn.Module):
         self._init_weights(cls_prior)
 
     def _init_weights(self, cls_prior: float = 0.01) -> None:
+        if self.architecture == "paper":
+            for module in self.shared_head.modules():
+                if isinstance(module, nn.Conv2d):
+                    nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0.0)
+            nn.init.normal_(self.prediction.weight, mean=0.0, std=0.01)
+            nn.init.constant_(self.prediction.bias, 0.0)
+            bias_value = math.log(cls_prior / (1.0 - cls_prior))
+            with torch.no_grad():
+                self.prediction.bias[: self.num_classes].fill_(bias_value)
+            return
+
         for module in [self.cls_tower, self.reg_tower]:
             for m in module.modules():
                 if isinstance(m, nn.Conv2d):
@@ -161,6 +210,13 @@ class LightweightDetectionHead(nn.Module):
         if side * side != num_patches:
             raise ValueError("Patch tokens must form a square feature map.")
         feature_map = patch_tokens.transpose(1, 2).reshape(batch, dim, side, side)
+
+        if self.architecture == "paper":
+            prediction = self.prediction(self.shared_head(feature_map))
+            return {
+                "class_logits": prediction[:, : self.num_classes],
+                "boxes": prediction[:, self.num_classes :],
+            }
 
         out = {
             "class_logits": self.cls_logits(self.cls_tower(feature_map)),

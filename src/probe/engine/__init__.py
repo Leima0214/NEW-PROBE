@@ -8,6 +8,7 @@ from .self_training import (
 from .detection import (
     apply_nms,
     collect_detections,
+    compute_interpolated_ap,
     compute_voc_ap,
     decode_boxes,
     detection_loss,
@@ -23,6 +24,7 @@ __all__ = [
     "SimSiamHeads",
     "apply_nms",
     "collect_detections",
+    "compute_interpolated_ap",
     "compute_voc_ap",
     "decode_boxes",
     "detection_loss",

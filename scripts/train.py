@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as T
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(Path(_PROJECT_ROOT)))
@@ -37,6 +37,7 @@ import timm
 import yaml
 
 from probe.data.road_damage import RoadDamageDataset
+from probe.data.transforms import DetectionTrainTransform
 from probe.engine.self_training import (
     DomainAlignmentHead,
     SimSiamHeads,
@@ -85,15 +86,8 @@ def eval_transform(image_size: int = 512) -> T.Compose:
     ])
 
 
-def train_transform(image_size: int = 512) -> T.Compose:
-    """Detection training transform with mild augmentation."""
-    return T.Compose([
-        T.Resize((image_size, image_size)),
-        T.RandomHorizontalFlip(p=0.5),
-        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+def train_transform(image_size: int = 512) -> DetectionTrainTransform:
+    return DetectionTrainTransform(image_size=image_size)
 
 
 def _unwrap_state_dict(state_dict: dict) -> dict:
@@ -275,7 +269,7 @@ def train_ssl_pretraining(
             # Step after accumulation window
             if (step + 1) % grad_accum == 0:
                 scaler.unscale_(optimizer)
-                optimizer.step()
+                scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -289,6 +283,12 @@ def train_ssl_pretraining(
                     f"loss {metrics['loss']:.4f}  ssl {metrics['ssl']:.4f}  "
                     f"prompt {metrics['prompt']:.4f}  dapa {metrics['dapa']:.4f}"
                 )
+
+        if steps % grad_accum != 0:
+            scaler.unscale_(optimizer)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         # Epoch summary
         avg = {k: epoch_losses[k] / steps for k in epoch_losses}
@@ -362,17 +362,40 @@ def train_detection_head(
           f"stride: {stride:.1f} px  |  image: {image_size}×{image_size}")
 
     # --- Datasets -----------------------------------------------------------
+    num_classes = cfg["detection"]["num_classes"]
     source_dataset = RoadDamageDataset(
         cfg["data"]["source_manifest"],
         cfg["data"]["image_root"],
-        transform=train_transform(image_size),  # augmented for training
+        joint_transform=train_transform(image_size),
         image_size=image_size,
+        num_classes=num_classes,
     )
-    val_dataset = RoadDamageDataset(
+    source_fraction = float(cfg["detection"].get("source_label_fraction", 1.0))
+    if not 0.0 < source_fraction <= 1.0:
+        raise ValueError("detection.source_label_fraction must be in (0, 1].")
+    if source_fraction < 1.0:
+        sample_count = max(1, round(len(source_dataset) * source_fraction))
+        generator = torch.Generator().manual_seed(int(cfg.get("seed", 42)))
+        indices = torch.randperm(len(source_dataset), generator=generator)[:sample_count]
+        source_dataset = Subset(source_dataset, indices.tolist())
+
+    source_val_manifest = cfg["data"].get("source_val_manifest")
+    source_val_dataset = None
+    if source_val_manifest:
+        source_val_dataset = RoadDamageDataset(
+            source_val_manifest,
+            cfg["data"]["image_root"],
+            transform=eval_transform(image_size),
+            image_size=image_size,
+            num_classes=num_classes,
+        )
+
+    target_val_dataset = RoadDamageDataset(
         cfg["data"]["val_manifest"],
         cfg["data"]["image_root"],
         transform=eval_transform(image_size),
         image_size=image_size,
+        num_classes=num_classes,
     )
 
     source_loader = DataLoader(
@@ -383,16 +406,13 @@ def train_detection_head(
         drop_last=False,  # keep all data, avoid wasting small datasets
         collate_fn=detection_collate,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg["data"]["batch_size"],
-        shuffle=False,
-        num_workers=cfg["data"]["num_workers"],
-        drop_last=False,
-        collate_fn=detection_collate,
-    )
 
-    print(f"Source: {len(source_dataset)} images  |  Val: {len(val_dataset)} images")
+    source_val_count = len(source_val_dataset) if source_val_dataset is not None else 0
+    print(
+        f"Source train: {len(source_dataset)} images  |  "
+        f"Source val: {source_val_count} images  |  "
+        f"Target test: {len(target_val_dataset)} images"
+    )
 
     # --- Label sanity check & class distribution ----------------------------
     source_label_counts: dict[int, int] = {}
@@ -403,15 +423,18 @@ def train_detection_head(
             source_unique.add(lbl)
     val_label_counts: dict[int, int] = {}
     val_unique = set()
-    for _, target in val_dataset:
-        for lbl in target["labels"].tolist():
-            val_label_counts[lbl] = val_label_counts.get(lbl, 0) + 1
-            val_unique.add(lbl)
+    if source_val_dataset is not None:
+        for _, target in source_val_dataset:
+            for lbl in target["labels"].tolist():
+                val_label_counts[lbl] = val_label_counts.get(lbl, 0) + 1
+                val_unique.add(lbl)
 
-    print(f"Source labels: {sorted(source_unique)}  |  Val labels: {sorted(val_unique)}")
-    num_classes = cfg["detection"]["num_classes"]
+    print(
+        f"Source train labels: {sorted(source_unique)}  |  "
+        f"Source val labels: {sorted(val_unique)}"
+    )
     print(f"Per-class GT box counts ({num_classes} classes):")
-    print(f"  {'Class':>6s}  {'Source':>8s}  {'Val':>8s}")
+    print(f"  {'Class':>6s}  {'Train':>8s}  {'Src val':>8s}")
     for c in range(num_classes):
         sc = source_label_counts.get(c, 0)
         vc = val_label_counts.get(c, 0)
@@ -460,6 +483,9 @@ def train_detection_head(
     center_sampling_radius = det_cfg.get("center_sampling_radius", 1.5)
     grad_clip = det_cfg.get("grad_clip", 1.0)
     use_centerness = ctr_weight > 0.0
+    box_mode = det_cfg.get("box_mode", "ltrb" if use_centerness else "center_size")
+    if use_centerness and box_mode != "ltrb":
+        raise ValueError("Centerness requires detection_optim.box_mode=ltrb.")
     checkpoint_dir = Path(args.checkpoint_dir)
     grad_accum = args.grad_accum
     effective_batch = cfg["data"]["batch_size"] * grad_accum
@@ -481,19 +507,26 @@ def train_detection_head(
           f"  |  GradScaler: {scaler.is_enabled()}"
           f"  |  centerness: {use_centerness}")
 
-    # torch.compile on A100 gives ~20% speedup (PyTorch >= 2.0)
+    # Keep the registered module unwrapped so checkpoints have stable keys.
+    head_for_forward = model.detection_head
     if not args.no_compile and hasattr(torch, "compile"):
         try:
-            model.detection_head = torch.compile(
+            head_for_forward = torch.compile(
                 model.detection_head, mode="reduce-overhead"
             )
             print("  torch.compile: enabled (reduce-overhead)")
         except Exception as e:
             print(f"  torch.compile: skipped ({e})")
 
-    best_map = 0.0
+    best_source_map = -1.0
     best_epoch = -1
-    history_det: dict[str, list[float]] = {"cls": [], "box": [], "ctr": [], "total": [], "mAP": []}
+    history_det: dict[str, list[float]] = {
+        "cls": [],
+        "box": [],
+        "ctr": [],
+        "total": [],
+        "source_mAP": [],
+    }
 
     for epoch in range(total_epochs):
         model.detection_head.train()
@@ -507,7 +540,7 @@ def train_detection_head(
             # Forward through frozen backbone
             with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 _, patch_tokens, _ = model.encode(images, prototype_state)
-                predictions = model.detection_head(patch_tokens)
+                predictions = head_for_forward(patch_tokens)
                 loss_dict = detection_loss(
                     predictions, targets, locations, stride,
                     focal_alpha=focal_alpha,
@@ -515,6 +548,7 @@ def train_detection_head(
                     box_weight=box_weight,
                     ctr_weight=ctr_weight,
                     center_sampling_radius=center_sampling_radius,
+                    box_mode=box_mode,
                 )
                 scaled_loss = loss_dict["det_total"] / grad_accum
 
@@ -544,6 +578,16 @@ def train_detection_head(
                     f"total {loss_dict['det_total'].item():.4f}"
                 )
 
+        # Flush a final partial accumulation window.
+        if steps % grad_accum != 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                model.detection_head.parameters(), max_norm=grad_clip
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
         scheduler.step()
 
         # Epoch summary
@@ -557,11 +601,15 @@ def train_detection_head(
             f"lr {scheduler.get_last_lr()[0]:.2e}"
         )
 
-        # Validation
-        if (epoch + 1) % val_interval == 0 or epoch == total_epochs - 1:
-            print("  evaluating mAP@0.5 ...")
+        # Select checkpoints only with source-domain labels. Target labels are
+        # reserved for one final zero-shot evaluation.
+        if (
+            source_val_dataset is not None
+            and ((epoch + 1) % val_interval == 0 or epoch == total_epochs - 1)
+        ):
+            print("  evaluating source-domain validation mAP ...")
             metrics = evaluate_map(
-                model, val_dataset, prototype_state, device,
+                model, source_val_dataset, prototype_state, device,
                 locations, stride,
                 num_classes=cfg["detection"]["num_classes"],
                 iou_threshold=0.5,
@@ -569,9 +617,10 @@ def train_detection_head(
                 nms_threshold=nms_threshold,
                 image_size=image_size,
                 use_centerness=use_centerness,
+                box_mode=box_mode,
             )
-            mAP = metrics["mAP@0.5"]
-            history_det["mAP"].append(mAP)
+            source_map = metrics["mAP@0.5"]
+            history_det["source_mAP"].append(source_map)
             class_aps = {k: v for k, v in metrics.items() if k.startswith("AP_cls_")}
             ap_parts = []
             for k, v in sorted(class_aps.items()):
@@ -580,34 +629,84 @@ def train_detection_head(
                 else:
                     ap_parts.append(f"c{k.split('_')[-1]}={v:.3f}")
             ap_str = "  ".join(ap_parts)
-            print(f"  mAP@0.5: {mAP:.4f}  |  {ap_str}")
+            print(
+                f"  source mAP@0.5: {source_map * 100:.2f}%  |  "
+                f"COCO-style mAP: {metrics['mAP@[.5:.95]'] * 100:.2f}%  |  {ap_str}"
+            )
 
-            if mAP > best_map:
-                best_map = mAP
+            if source_map > best_source_map:
+                best_source_map = source_map
                 best_epoch = epoch
                 best_path = checkpoint_dir / "probe_det_best.pt"
                 torch.save({
                     "epoch": epoch,
                     "model": _unwrap_state_dict(model.state_dict()),
-                    "detection_head": model.detection_head.state_dict(),
+                    "detection_head": _unwrap_state_dict(
+                        model.detection_head.state_dict()
+                    ),
                     "prototype_state": prototype_state,
                     "optimizer": optimizer.state_dict(),
-                    "mAP": mAP,
+                    "source_mAP": source_map,
                     "class_aps": class_aps,
                 }, best_path)
-                print(f"  best model → {best_path}  (mAP={best_map:.4f})")
+                print(
+                    f"  best source-selected model → {best_path}  "
+                    f"(mAP={best_source_map * 100:.2f}%)"
+                )
+
+    # If no source validation manifest is available, use the final model.
+    if source_val_dataset is None:
+        best_epoch = total_epochs - 1
+        best_source_map = float("nan")
+        best_path = checkpoint_dir / "probe_det_best.pt"
+        torch.save({
+            "epoch": best_epoch,
+            "model": _unwrap_state_dict(model.state_dict()),
+            "detection_head": _unwrap_state_dict(model.detection_head.state_dict()),
+            "prototype_state": prototype_state,
+            "source_mAP": best_source_map,
+        }, best_path)
+
+    # Restore the source-selected model, then touch target labels exactly once.
+    selected = torch.load(best_path, map_location=device, weights_only=False)
+    model.load_state_dict(selected["model"], strict=True)
+    print("\nFinal zero-shot evaluation on target domain ...")
+    target_metrics = evaluate_map(
+        model, target_val_dataset, prototype_state, device,
+        locations, stride,
+        num_classes=cfg["detection"]["num_classes"],
+        iou_threshold=0.5,
+        score_threshold=score_threshold,
+        nms_threshold=nms_threshold,
+        image_size=image_size,
+        use_centerness=use_centerness,
+        box_mode=box_mode,
+    )
+    target_map = target_metrics["mAP@0.5"]
+    target_coco_map = target_metrics["mAP@[.5:.95]"]
+    print(
+        f"Target zero-shot mAP@0.5: {target_map * 100:.2f}%  |  "
+        f"COCO-style mAP: {target_coco_map * 100:.2f}%"
+    )
 
     # Final Phase 3 checkpoint
     final_path = checkpoint_dir / "probe_det_final.pt"
     torch.save({
-        "epoch": total_epochs - 1,
+        "epoch": best_epoch,
+        "trained_epochs": total_epochs,
         "model": _unwrap_state_dict(model.state_dict()),
-        "detection_head": model.detection_head.state_dict(),
+        "detection_head": _unwrap_state_dict(model.detection_head.state_dict()),
         "prototype_state": prototype_state,
-        "best_mAP": best_map,
+        "best_source_mAP": best_source_map,
         "best_epoch": best_epoch,
+        "target_mAP@0.5": target_map,
+        "target_mAP@[.5:.95]": target_coco_map,
+        "target_metrics": target_metrics,
     }, final_path)
-    print(f"\nPhase 3 complete.  Best mAP@0.5: {best_map:.4f}  (epoch {best_epoch})")
+    print(
+        f"\nPhase 3 complete. Target zero-shot mAP@0.5: {target_map * 100:.2f}% "
+        f"(source-selected epoch {best_epoch})"
+    )
     print(f"Final checkpoint → {final_path}")
 
 
@@ -655,6 +754,11 @@ def main() -> None:
     with open(args.config, "r", encoding="utf-8") as handle:
         cfg = yaml.safe_load(handle)
 
+    seed = int(cfg.get("seed", 42))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     if args.batch_size is not None:
         cfg["data"]["batch_size"] = args.batch_size
 
@@ -691,6 +795,12 @@ def main() -> None:
         cls_prior=cfg["detection"].get("cls_prior", 0.01),
         head_depth=cfg["detection"].get("head_depth", 3),
         use_centerness=det_use_ctr,
+        architecture=cfg["detection"].get(
+            "architecture",
+            "fcos" if det_use_ctr else "paper",
+        ),
+        paper_mid_dim=cfg["detection"].get("paper_mid_dim", 384),
+        paper_neck_dim=cfg["detection"].get("paper_neck_dim", 128),
     )
     model = PROBEModel(backbone, detection_head).to(device)
 

@@ -84,18 +84,32 @@ def main() -> None:
         vit, prompt_projector,
         injection_layers=tuple(cfg["spem"]["injection_layers"]),
     )
+    det_cfg = cfg.get("detection_optim", {})
+    use_centerness = det_cfg.get("ctr_weight", 0.0) > 0.0
     detection_head = LightweightDetectionHead(
         embed_dim=cfg["backbone"]["embed_dim"],
         hidden_dim=cfg["detection"]["hidden_dim"],
-        neck_dim=cfg["detection"]["neck_dim"],
         num_classes=cfg["detection"]["num_classes"],
+        cls_prior=cfg["detection"].get("cls_prior", 0.01),
+        head_depth=cfg["detection"].get("head_depth", 3),
+        use_centerness=use_centerness,
+        architecture=cfg["detection"].get(
+            "architecture",
+            "fcos" if use_centerness else "paper",
+        ),
+        paper_mid_dim=cfg["detection"].get("paper_mid_dim", 384),
+        paper_neck_dim=cfg["detection"].get("paper_neck_dim", 128),
     )
     model = PROBEModel(backbone, detection_head).to(device)
 
     # --- Load checkpoint ----------------------------------------------------
     print(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"], strict=True)
+    model_state = {
+        key.replace("_orig_mod.", ""): value
+        for key, value in ckpt["model"].items()
+    }
+    model.load_state_dict(model_state, strict=True)
 
     prototype_state = ckpt["prototype_state"]
     if isinstance(prototype_state, PrototypeState):
@@ -129,6 +143,8 @@ def main() -> None:
             T.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225]),
         ]),
+        image_size=args.image_size,
+        num_classes=cfg["detection"]["num_classes"],
     )
     print(f"Running inference on {len(dataset)} images ...")
 
@@ -146,6 +162,11 @@ def main() -> None:
             score_threshold=args.score_threshold,
             max_detections=args.max_detections,
             image_size=args.image_size,
+            use_centerness=use_centerness,
+            box_mode=det_cfg.get(
+                "box_mode",
+                "ltrb" if use_centerness else "center_size",
+            ),
         )
         boxes, scores, labels = apply_nms(
             boxes, scores, labels,

@@ -48,6 +48,11 @@ det_head = LightweightDetectionHead(
     cfg["detection"]["num_classes"],
     cls_prior=cfg["detection"].get("cls_prior", 0.01),
     use_centerness=use_ctr,
+    architecture=cfg["detection"].get(
+        "architecture", "fcos" if use_ctr else "paper"
+    ),
+    paper_mid_dim=cfg["detection"].get("paper_mid_dim", 384),
+    paper_neck_dim=cfg["detection"].get("paper_neck_dim", 128),
 )
 model = PROBEModel(backbone, det_head).to(DEVICE)
 
@@ -113,6 +118,7 @@ metrics = evaluate_map(
     image_size=IMAGE_SIZE,
     max_samples=NUM_SAMPLES,
     use_centerness=use_ctr,
+    box_mode=det_cfg.get("box_mode", "ltrb" if use_ctr else "center_size"),
 )
 
 print(f"\n{'='*60}")
@@ -130,6 +136,6 @@ elif metrics["mAP@0.5"] < 0.20:
     print("\n⚠️  mAP 0.05-0.20 on training data → Detection head is weak but functional")
     print("   Check label assignment, loss weights, or learning rate.")
 else:
-    print("\n✓  mAP > 0.20 on training data → Detection head works correctly")
-    print("   The cross-domain gap (United→Czech) is the real issue.")
-    print("   Switch to Japan→Czech for paper-aligned results.")
+    print("\nSource-domain fitting is functional (mAP > 0.20).")
+    print("This verifies checkpoint loading and basic fitting only; it does not")
+    print("prove paper alignment or rule out data, metric, and transfer defects.")

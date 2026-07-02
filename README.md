@@ -52,6 +52,24 @@ python scripts/train.py --config configs/probe_base.yaml
 python scripts/infer.py --config configs/probe_base.yaml --checkpoint path/to/checkpoint.pt
 ```
 
+### Japan to Czech Phase 3
+
+Start from a completed Phase 2 checkpoint. Phase 3 freezes the prompt-enhanced
+ViT, selects the detection checkpoint with Japan source-validation labels, and
+uses Czech labels only for the final zero-shot evaluation.
+
+```bash
+python scripts/train.py \
+  --config configs/probe_a100.yaml \
+  --phase 3 \
+  --resume checkpoints/probe_final.pt \
+  --device cuda \
+  --image-size 512
+```
+
+The terminal reports `mAP@0.5` and `mAP@[.5:.95]` as percentages. Checkpoint
+values remain in the conventional `[0, 1]` range.
+
 The current release is intentionally a research scaffold. It documents the method interfaces and critical control flow without bundling private datasets or final training recipes.
 
 ## Citation

@@ -1,7 +1,8 @@
-"""Detection training and inference for PROBE Phase 3.
+"""Detection training, inference, and evaluation for PROBE Phase 3.
 
-FCOS-style dense prediction with [l, t, r, b] box encoding, Focal Loss,
-GIoU regression loss, centerness BCE, and VOC 11-point mAP evaluation.
+The paper-aligned path uses C+4 dense prediction with center-size boxes,
+Focal Loss, GIoU regression, class-wise NMS, and continuous AP metrics.
+The earlier FCOS-style ltrb/centerness path remains available for ablations.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ def encode_boxes(
     locations: torch.Tensor,
     stride: float,
     center_sampling_radius: float = 1.5,
+    guarantee_gt_match: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FCOS box encoding with center sampling (standard practice).
 
@@ -88,6 +90,29 @@ def encode_boxes(
     mask = inside_float.sum(dim=1) > 0
     assigned_idx[~mask] = -1
 
+    # Thin road cracks can fall entirely between ViT patch centres. For the
+    # centre-size box parameterisation, reserve the nearest free grid location
+    # so every GT contributes classification and GIoU supervision.
+    if guarantee_gt_match:
+        represented = set(assigned_idx[mask].tolist())
+        claimed = set(torch.where(mask)[0].tolist())
+        centre_x = (x1 + x2) * 0.5
+        centre_y = (y1 + y2) * 0.5
+        centres = torch.stack([centre_x, centre_y], dim=-1)
+        distances = torch.cdist(centres, locations)
+        for gt_idx in range(N):
+            if gt_idx in represented:
+                continue
+            candidates = distances[gt_idx].argsort()
+            location_idx = next(
+                (int(idx) for idx in candidates.tolist() if int(idx) not in claimed),
+                int(candidates[0]),
+            )
+            assigned_idx[location_idx] = gt_idx
+            mask[location_idx] = True
+            claimed.add(location_idx)
+            represented.add(gt_idx)
+
     idx_safe = assigned_idx.clamp(min=0)
     assigned_boxes = gt_boxes[idx_safe]
     lt = torch.stack([
@@ -104,12 +129,26 @@ def decode_boxes(
     locations: torch.Tensor,
     stride: float,
     max_size: float = 512.0,
+    box_mode: str = "center_size",
 ) -> torch.Tensor:
-    lt_rb = F.softplus(box_preds) * stride  # softplus more stable than exp for small values
-    x1 = locations[:, 0] - lt_rb[:, 0]
-    y1 = locations[:, 1] - lt_rb[:, 1]
-    x2 = locations[:, 0] + lt_rb[:, 2]
-    y2 = locations[:, 1] + lt_rb[:, 3]
+    if box_mode == "ltrb":
+        lt_rb = F.softplus(box_preds) * stride
+        x1 = locations[:, 0] - lt_rb[:, 0]
+        y1 = locations[:, 1] - lt_rb[:, 1]
+        x2 = locations[:, 0] + lt_rb[:, 2]
+        y2 = locations[:, 1] + lt_rb[:, 3]
+    elif box_mode == "center_size":
+        centre_offsets = torch.tanh(box_preds[:, :2]) * stride
+        centres = locations + centre_offsets
+        sizes = F.softplus(box_preds[:, 2:]) * stride
+        half_sizes = sizes * 0.5
+        x1 = centres[:, 0] - half_sizes[:, 0]
+        y1 = centres[:, 1] - half_sizes[:, 1]
+        x2 = centres[:, 0] + half_sizes[:, 0]
+        y2 = centres[:, 1] + half_sizes[:, 1]
+    else:
+        raise ValueError(f"Unknown box_mode: {box_mode}")
+
     boxes = torch.stack([x1, y1, x2, y2], dim=-1)
     boxes[:, 0].clamp_(min=0.0, max=max_size)
     boxes[:, 1].clamp_(min=0.0, max=max_size)
@@ -153,9 +192,7 @@ def sigmoid_focal_loss(
         loss = alpha_t * loss
     if reduction == "mean":
         num_pos = targets.sum()
-        if num_pos > 0:
-            return loss.sum() / num_pos
-        return loss.sum() * 0.0
+        return loss.sum() / num_pos.clamp(min=1.0)
     elif reduction == "sum":
         return loss.sum()
     return loss
@@ -179,6 +216,7 @@ def detection_loss(
     box_weight: float = 1.0,
     ctr_weight: float = 1.0,
     center_sampling_radius: float = 1.5,
+    box_mode: str = "center_size",
 ) -> dict[str, torch.Tensor]:
     cls_logits = predictions["class_logits"]
     box_preds = predictions["boxes"]
@@ -188,15 +226,31 @@ def detection_loss(
     device = cls_logits.device
 
     use_ctr = ctr_weight > 0.0
+    if use_ctr and box_mode != "ltrb":
+        raise ValueError("Centerness is only defined for ltrb box regression.")
     ctr_logits = predictions.get("centerness") if use_ctr else None
     cls_losses, box_losses, ctr_losses = [], [], []
 
     for b in range(B):
         gt_boxes = targets[b]["boxes"].to(device)
         gt_labels = targets[b]["labels"].to(device)
+        if gt_labels.numel() > 0:
+            if int(gt_labels.min()) < 0 or int(gt_labels.max()) >= C:
+                raise ValueError(
+                    f"Target labels must be in [0, {C - 1}], got "
+                    f"[{int(gt_labels.min())}, {int(gt_labels.max())}]."
+                )
 
         reg_target, pos_mask, assigned_idx = encode_boxes(
-            gt_boxes, locations, stride, center_sampling_radius=center_sampling_radius
+            gt_boxes,
+            locations,
+            stride,
+            center_sampling_radius=(
+                min(center_sampling_radius, 1.0)
+                if box_mode == "center_size"
+                else center_sampling_radius
+            ),
+            guarantee_gt_match=(box_mode == "center_size"),
         )
 
         cls_target = torch.zeros(K, C, device=device)
@@ -215,7 +269,12 @@ def detection_loss(
 
         n_pos = pos_idx.numel()
         if n_pos > 0:
-            pred_boxes_decoded = decode_boxes(box_pred[pos_idx], locations[pos_idx], stride)
+            pred_boxes_decoded = decode_boxes(
+                box_pred[pos_idx],
+                locations[pos_idx],
+                stride,
+                box_mode=box_mode,
+            )
             gt_boxes_assigned = gt_boxes[assigned_idx[pos_idx]]
             box_loss = giou_loss(pred_boxes_decoded, gt_boxes_assigned)
             box_losses.append(box_loss)
@@ -252,6 +311,7 @@ def collect_detections(
     max_detections: int = 196,
     image_size: float = 512.0,
     use_centerness: bool = False,
+    box_mode: str = "center_size",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     cls_logits = predictions["class_logits"]
     box_preds = predictions["boxes"]
@@ -293,7 +353,13 @@ def collect_detections(
     box_preds_kept = box_preds[keep]
     locs = locations[keep]
 
-    boxes = decode_boxes(box_preds_kept, locs, stride, max_size=image_size)
+    boxes = decode_boxes(
+        box_preds_kept,
+        locs,
+        stride,
+        max_size=image_size,
+        box_mode=box_mode,
+    )
 
     if scores.numel() > max_detections:
         topk = scores.topk(max_detections).indices
@@ -328,7 +394,7 @@ def apply_nms(
 
 
 # ---------------------------------------------------------------------------
-# mAP (VOC 2007 11-point)
+# Detection metrics
 # ---------------------------------------------------------------------------
 
 def compute_iou(box1: torch.Tensor, box2: torch.Tensor) -> float:
@@ -358,6 +424,81 @@ def compute_voc_ap(recalls: list[float], precisions: list[float]) -> float:
     return ap
 
 
+def compute_interpolated_ap(recalls: list[float], precisions: list[float]) -> float:
+    """COCO-style AP over 101 uniformly spaced recall thresholds."""
+    if not recalls:
+        return 0.0
+    interpolated = []
+    for threshold in torch.linspace(0.0, 1.0, 101).tolist():
+        candidates = [
+            precision
+            for recall, precision in zip(recalls, precisions)
+            if recall >= threshold
+        ]
+        interpolated.append(max(candidates, default=0.0))
+    return sum(interpolated) / len(interpolated)
+
+
+def _evaluate_detections_at_iou(
+    all_gt: dict[int, list[dict]],
+    all_det: dict[int, list[dict]],
+    num_classes: int,
+    iou_threshold: float,
+) -> dict[int, float | None]:
+    class_aps: dict[int, float | None] = {}
+    for class_id in range(num_classes):
+        dets = sorted(
+            all_det[class_id],
+            key=lambda item: item["confidence"],
+            reverse=True,
+        )
+        gts = all_gt[class_id]
+        total_gt = len(gts)
+        if total_gt == 0:
+            class_aps[class_id] = None
+            continue
+
+        matched = [False] * total_gt
+        true_positives: list[int] = []
+        false_positives: list[int] = []
+        for det in dets:
+            best_iou = 0.0
+            best_gt_idx = -1
+            for gt_idx, gt in enumerate(gts):
+                if matched[gt_idx] or gt["image_id"] != det["image_id"]:
+                    continue
+                overlap = compute_iou(det["box"], gt["box"])
+                if overlap > best_iou:
+                    best_iou = overlap
+                    best_gt_idx = gt_idx
+
+            if best_gt_idx >= 0 and best_iou >= iou_threshold:
+                matched[best_gt_idx] = True
+                true_positives.append(1)
+                false_positives.append(0)
+            else:
+                true_positives.append(0)
+                false_positives.append(1)
+
+        tp_cum = (
+            torch.tensor(true_positives).cumsum(dim=0).tolist()
+            if true_positives
+            else []
+        )
+        fp_cum = (
+            torch.tensor(false_positives).cumsum(dim=0).tolist()
+            if false_positives
+            else []
+        )
+        recalls = [tp / total_gt for tp in tp_cum]
+        precisions = [
+            tp_cum[i] / max(tp_cum[i] + fp_cum[i], 1)
+            for i in range(len(tp_cum))
+        ]
+        class_aps[class_id] = compute_interpolated_ap(recalls, precisions)
+    return class_aps
+
+
 @torch.no_grad()
 def evaluate_map(
     model,
@@ -373,7 +514,8 @@ def evaluate_map(
     image_size: int = 512,
     max_samples: Optional[int] = None,
     use_centerness: bool = False,
-) -> dict[str, float]:
+    box_mode: str = "center_size",
+) -> dict[str, float | None]:
     import torchvision.transforms as T
 
     model.eval()
@@ -392,8 +534,11 @@ def evaluate_map(
 
         for box, label in zip(gt_boxes, gt_labels):
             c = int(label.item())
-            if c < num_classes:
-                all_gt[c].append({"image_id": idx, "box": box, "matched": False})
+            if not 0 <= c < num_classes:
+                raise ValueError(
+                    f"Ground-truth label {c} is outside [0, {num_classes - 1}]."
+                )
+            all_gt[c].append({"image_id": idx, "box": box})
 
         if isinstance(img, torch.Tensor):
             tensor = img.unsqueeze(0).to(device)
@@ -410,6 +555,7 @@ def evaluate_map(
             predictions, locations, stride,
             score_threshold=score_threshold, image_size=image_size,
             use_centerness=use_centerness,
+            box_mode=box_mode,
         )
         det_boxes, det_scores, det_labels = apply_nms(
             det_boxes, det_scores, det_labels, iou_threshold=nms_threshold,
@@ -417,55 +563,42 @@ def evaluate_map(
 
         for box, score, label in zip(det_boxes, det_scores, det_labels):
             c = int(label.item())
-            if c < num_classes:
-                all_det[c].append({
-                    "image_id": idx, "confidence": score.item(), "box": box.cpu(),
-                })
+            if not 0 <= c < num_classes:
+                raise ValueError(
+                    f"Predicted label {c} is outside [0, {num_classes - 1}]."
+                )
+            all_det[c].append({
+                "image_id": idx,
+                "confidence": score.item(),
+                "box": box.cpu(),
+            })
 
-    aps = {}
-    classes_with_gt = 0
-    for c in range(num_classes):
-        dets = all_det[c]
-        gts = all_gt[c]
-        dets.sort(key=lambda x: x["confidence"], reverse=True)
-        for gt in gts:
-            gt["matched"] = False
+    ap50_by_class = _evaluate_detections_at_iou(
+        all_gt,
+        all_det,
+        num_classes,
+        iou_threshold,
+    )
+    metrics: dict[str, float | None] = {
+        f"AP_cls_{class_id}": ap
+        for class_id, ap in ap50_by_class.items()
+    }
+    valid_ap50 = [ap for ap in ap50_by_class.values() if ap is not None]
+    metrics["mAP@0.5"] = (
+        sum(valid_ap50) / len(valid_ap50)
+        if valid_ap50
+        else 0.0
+    )
 
-        total_gt = len(gts)
-
-        # Skip classes that have no ground-truth in the validation set.
-        # Including them as 0 AP would unfairly penalise mAP when the
-        # dataset simply doesn't contain that damage category.
-        if total_gt == 0:
-            aps[f"AP_cls_{c}"] = None
-            continue
-
-        classes_with_gt += 1
-
-        tp, fp = [], []
-        for det in dets:
-            best_iou, best_gt = 0.0, None
-            for gt in gts:
-                if gt["image_id"] != det["image_id"] or gt["matched"]:
-                    continue
-                iou = compute_iou(det["box"], gt["box"])
-                if iou > best_iou:
-                    best_iou, best_gt = iou, gt
-            if best_iou >= iou_threshold and best_gt is not None:
-                tp.append(1); fp.append(0)
-                best_gt["matched"] = True
-            else:
-                tp.append(0); fp.append(1)
-
-        tp_cum = torch.tensor(tp).cumsum(dim=0).tolist() if tp else []
-        fp_cum = torch.tensor(fp).cumsum(dim=0).tolist() if fp else []
-        recalls = [t / max(total_gt, 1) for t in tp_cum]
-        precisions = [
-            tp_cum[i] / max(tp_cum[i] + fp_cum[i], 1) for i in range(len(tp_cum))
-        ]
-        aps[f"AP_cls_{c}"] = compute_voc_ap(recalls, precisions)
-
-    # mAP averaged only over classes that actually appear in the validation set
-    valid_aps = [v for v in aps.values() if v is not None]
-    aps["mAP@0.5"] = sum(valid_aps) / max(len(valid_aps), 1) if valid_aps else 0.0
-    return aps
+    coco_maps = []
+    for threshold in [0.50 + 0.05 * idx for idx in range(10)]:
+        class_aps = _evaluate_detections_at_iou(
+            all_gt,
+            all_det,
+            num_classes,
+            threshold,
+        )
+        valid = [ap for ap in class_aps.values() if ap is not None]
+        coco_maps.append(sum(valid) / len(valid) if valid else 0.0)
+    metrics["mAP@[.5:.95]"] = sum(coco_maps) / len(coco_maps)
+    return metrics

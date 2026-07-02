@@ -1,8 +1,7 @@
-
-
-# A100-optimised PROBE config (~80 GB VRAM)
-# Usage: python scripts/train.py --config configs/probe_a100.yaml --phase 3
-#        --resume checkpoints_from_v100/probe_final.pt
+# A100-optimized Japan-to-Czech PROBE reproduction config.
+# Phase 3 only:
+# python scripts/train.py --config configs/probe_a100.yaml --phase 3 \
+#   --resume checkpoints/probe_final.pt --device cuda --image-size 512
 seed: 42
 device: cuda
 
@@ -29,27 +28,33 @@ ssl:
   out_dim: 2048
 
 detection:
-  num_classes: 4   # paper: 4 road-damage classes (D00-D40, excl. missing class)
-  hidden_dim: 256
-  head_depth: 3
-  source_label_fraction: 0.1
-  cls_prior: 0.01  # paper-aligned: log(0.01) ≈ -4.595 bias → ~1% positive prior
+  num_classes: 4
+  architecture: paper
+  paper_mid_dim: 384
+  paper_neck_dim: 128
+  hidden_dim: 256          # Used only by architecture=fcos.
+  head_depth: 3            # Used only by architecture=fcos.
+  source_label_fraction: 1.0
+  cls_prior: 0.01
 
 detection_optim:
-  lr: 0.001             # paper: 1e-3 for detection head
+  # The paper does not disclose the Phase 3 optimizer recipe. These values
+  # are explicit reproduction assumptions for the lightweight head.
+  lr: 0.001
   lr_min: 0.000001
   weight_decay: 0.0001
-  epochs: 100            # paper-aligned: 100 epochs
-  warmup_epochs: 5       # linear warmup
-  grad_clip: 1.0         # paper recommendation
+  epochs: 100
+  warmup_epochs: 5
+  grad_clip: 1.0
   focal_alpha: 0.25
   focal_gamma: 2.0
-  box_weight: 2.0        # 5.0 drowns cls; 2.0 more balanced for cross-domain
-  ctr_weight: 0.0        # paper: C+4, no centerness/objectness branch
+  box_weight: 2.0
+  ctr_weight: 0.0
+  box_mode: center_size
   score_threshold: 0.005
   nms_threshold: 0.5
   val_interval: 5
-  center_sampling_radius: 2.5  # wider radius for road-damage small/long cracks
+  center_sampling_radius: 1.0
 
 optim:
   lr: 0.0005
@@ -57,9 +62,10 @@ optim:
   pretrain_epochs: 100
 
 data:
-  source_manifest: /PROBE/data/japan_train.jsonl              # paper: RDD-Japan → CRDDC'22
+  source_manifest: /PROBE/data/japan_train.jsonl
+  source_val_manifest: /PROBE/data/japan_val.jsonl
   target_manifest: /PROBE/data/Czech_unlabeled.jsonl
-  val_manifest: /PROBE/data/czech_val.jsonl   # 或 United_val.jsonl
+  val_manifest: /PROBE/data/czech_val.jsonl
   image_root: /PROBE/data/images
-  batch_size: 32                                # A100 80GB 可用 32-64
-  num_workers: 8                                # 匹配云实例 CPU
+  batch_size: 32
+  num_workers: 8
