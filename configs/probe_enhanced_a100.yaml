@@ -1,7 +1,5 @@
-# A100-optimized Japan-to-Czech PROBE reproduction config.
-# Phase 3 only:
-# python scripts/train.py --config configs/probe_a100.yaml --phase 3 \
-#   --resume checkpoints/probe_final.pt --device cuda --image-size 512
+# PROBE-inspired enhanced Japan-to-Czech configuration.
+# Keeps ViT frozen but jointly adapts the prompt projector and detection head.
 seed: 42
 device: cuda
 
@@ -9,6 +7,7 @@ backbone:
   name: vit_base_patch16_224
   embed_dim: 768
   frozen: true
+  detection_layers: [2, 5, 8, 11]
 
 spem:
   pca_dim: 50
@@ -29,32 +28,32 @@ ssl:
 
 detection:
   num_classes: 4
-  architecture: paper
+  architecture: fcos
   paper_mid_dim: 384
   paper_neck_dim: 128
-  hidden_dim: 256          # Used only by architecture=fcos.
-  head_depth: 3            # Used only by architecture=fcos.
+  hidden_dim: 256
+  head_depth: 3
   source_label_fraction: 1.0
   cls_prior: 0.01
 
 detection_optim:
-  # The paper does not disclose the Phase 3 optimizer recipe. These values
-  # are explicit reproduction assumptions for the lightweight head.
   lr: 0.001
+  prompt_lr: 0.00005
+  train_prompt_projector: true
   lr_min: 0.000001
   weight_decay: 0.0001
-  epochs: 100
+  epochs: 20
   warmup_epochs: 5
   grad_clip: 1.0
   focal_alpha: 0.25
   focal_gamma: 2.0
   box_weight: 2.0
-  ctr_weight: 0.0
-  box_mode: center_size
+  ctr_weight: 1.0
+  box_mode: ltrb
   score_threshold: 0.005
   nms_threshold: 0.5
   val_interval: 5
-  center_sampling_radius: 1.0
+  center_sampling_radius: 1.5
 
 optim:
   lr: 0.0005
@@ -64,7 +63,6 @@ optim:
 data:
   source_manifest: /PROBE/data/japan_train.jsonl
   source_val_manifest: /PROBE/data/japan_val.jsonl
-  # Target labels are loaded by the dataset but never consumed in Phase 1/2.
   target_manifest: /PROBE/data/czech_train.jsonl
   val_manifest: /PROBE/data/czech_val.jsonl
   image_root: /PROBE/data/images

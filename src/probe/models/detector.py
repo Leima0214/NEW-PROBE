@@ -24,11 +24,18 @@ class PromptEnhancedViT(nn.Module):
         vit: nn.Module,
         prompt_projector: PromptProjector,
         injection_layers: tuple[int, ...] = (0, 6),
+        detection_layers: tuple[int, ...] = (),
     ) -> None:
         super().__init__()
         self.vit = vit
         self.prompt_projector = prompt_projector
         self.injector = PromptInjector(injection_layers)
+        self.detection_layers = set(detection_layers)
+        if any(
+            layer < 0 or layer >= len(self.vit.blocks)
+            for layer in self.detection_layers
+        ):
+            raise ValueError("detection_layers contains an invalid ViT block index.")
         self.freeze_backbone()
 
     def freeze_backbone(self) -> None:
@@ -55,6 +62,7 @@ class PromptEnhancedViT(nn.Module):
             batch_size=images.shape[0],
         )
         processed_prompts = prompts
+        detection_tokens = []
 
         for layer_id, block in enumerate(self.vit.blocks):
             if self.injector.should_inject(layer_id):
@@ -65,17 +73,27 @@ class PromptEnhancedViT(nn.Module):
                 tokens = self.injector.remove(tokens, K)
             else:
                 tokens = block(tokens)
+            if layer_id in self.detection_layers:
+                detection_tokens.append(self.vit.norm(tokens)[:, 1:])
 
-        return self.vit.norm(tokens), prompts, processed_prompts
+        tokens = self.vit.norm(tokens)
+        patch_tokens = (
+            torch.stack(detection_tokens).mean(dim=0)
+            if detection_tokens
+            else tokens[:, 1:]
+        )
+        return tokens, patch_tokens, processed_prompts
 
     def forward(
         self,
         images: torch.Tensor,
         prototype_state: PrototypeState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        tokens, _, processed_prompts = self.forward_tokens(images, prototype_state)
+        tokens, patch_tokens, processed_prompts = self.forward_tokens(
+            images,
+            prototype_state,
+        )
         image_features = tokens[:, 0]
-        patch_tokens = tokens[:, 1:]
         return image_features, patch_tokens, processed_prompts
 
 

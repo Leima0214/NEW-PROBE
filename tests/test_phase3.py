@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import sys
 import tempfile
@@ -5,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -18,10 +20,49 @@ from probe.engine.detection import (
     generate_grid,
     sigmoid_focal_loss,
 )
-from probe.models.detector import LightweightDetectionHead
+from probe.models.detector import LightweightDetectionHead, PromptEnhancedViT
+from probe.models.prompts import PromptProjector, PrototypeState
+
+
+class _AddConstant(nn.Module):
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.value = value
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return tokens + self.value
+
+
+_TRAIN_SPEC = importlib.util.spec_from_file_location(
+    "probe_train_script",
+    Path(__file__).resolve().parents[1] / "scripts" / "train.py",
+)
+assert _TRAIN_SPEC is not None and _TRAIN_SPEC.loader is not None
+_TRAIN_MODULE = importlib.util.module_from_spec(_TRAIN_SPEC)
+_TRAIN_SPEC.loader.exec_module(_TRAIN_MODULE)
+_label_counts = _TRAIN_MODULE._label_counts
 
 
 class DetectionDataTests(unittest.TestCase):
+    def test_label_counts_support_subsets_without_loading_images(self) -> None:
+        dataset = type(
+            "ManifestOnlyDataset",
+            (),
+            {
+                "samples": [
+                    {"labels": [0, 1]},
+                    {"labels": [1, 1]},
+                    {"labels": []},
+                ]
+            },
+        )()
+
+        self.assertEqual(_label_counts(dataset), {0: 1, 1: 3})
+        self.assertEqual(
+            _label_counts(torch.utils.data.Subset(dataset, [0, 2])),
+            {0: 1, 1: 1},
+        )
+
     def test_horizontal_flip_updates_boxes(self) -> None:
         transform = DetectionTrainTransform(
             image_size=100,
@@ -57,6 +98,60 @@ class DetectionDataTests(unittest.TestCase):
 
 
 class DetectionModelTests(unittest.TestCase):
+    def test_backbone_averages_requested_detection_layers(self) -> None:
+        vit = nn.Module()
+        vit.patch_embed = nn.Conv2d(3, 8, kernel_size=4, stride=4)
+        vit.cls_token = nn.Parameter(torch.zeros(1, 1, 8))
+        vit.pos_embed = nn.Parameter(torch.zeros(1, 5, 8))
+        vit.blocks = nn.ModuleList([_AddConstant(1.0), _AddConstant(3.0)])
+        vit.norm = nn.Identity()
+        projector = PromptProjector(pca_dim=2, embed_dim=8, hidden_dim=4)
+        backbone = PromptEnhancedViT(
+            vit,
+            projector,
+            injection_layers=(),
+            detection_layers=(0, 1),
+        )
+        state = PrototypeState(
+            mean=torch.zeros(8),
+            components=torch.zeros(8, 2),
+            centroids=torch.randn(3, 2),
+        )
+        images = torch.randn(2, 3, 8, 8)
+        initial_patches = backbone.patchify(images)[:, 1:]
+
+        _, fused_patches, _ = backbone(images, state)
+
+        torch.testing.assert_close(fused_patches, initial_patches + 2.5)
+
+    def test_backbone_returns_image_conditioned_prompts(self) -> None:
+        vit = nn.Module()
+        vit.patch_embed = nn.Conv2d(3, 8, kernel_size=4, stride=4)
+        vit.cls_token = nn.Parameter(torch.zeros(1, 1, 8))
+        vit.pos_embed = nn.Parameter(torch.zeros(1, 5, 8))
+        vit.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=8,
+                nhead=2,
+                batch_first=True,
+                dropout=0.0,
+            )
+        ])
+        vit.norm = nn.Identity()
+        projector = PromptProjector(pca_dim=2, embed_dim=8, hidden_dim=4)
+        backbone = PromptEnhancedViT(vit, projector, injection_layers=(0,))
+        state = PrototypeState(
+            mean=torch.zeros(8),
+            components=torch.zeros(8, 2),
+            centroids=torch.randn(3, 2),
+        )
+
+        _, _, returned_prompts = backbone(torch.randn(2, 3, 8, 8), state)
+        raw_prompts = projector(state.centroids, batch_size=2)
+
+        self.assertFalse(torch.allclose(returned_prompts, raw_prompts))
+        self.assertFalse(torch.allclose(returned_prompts[0], returned_prompts[1]))
+
     def test_paper_head_outputs_c_plus_four(self) -> None:
         head = LightweightDetectionHead(
             embed_dim=32,

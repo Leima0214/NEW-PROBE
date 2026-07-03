@@ -39,7 +39,12 @@ else:
     print("Loading Phase 2 checkpoint (detection head will be UNTRAINED!)")
 
 prompt_projector = PromptProjector(50, 768, 256)
-backbone = PromptEnhancedViT(vit, prompt_projector, injection_layers=(0, 6))
+backbone = PromptEnhancedViT(
+    vit,
+    prompt_projector,
+    injection_layers=(0, 6),
+    detection_layers=tuple(cfg["backbone"].get("detection_layers", ())),
+)
 
 det_cfg = cfg.get("detection_optim", {})
 use_ctr = det_cfg.get("ctr_weight", 1.0) > 0.0

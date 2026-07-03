@@ -103,6 +103,19 @@ def detection_collate(batch: list) -> tuple:
     return images, targets
 
 
+def _label_counts(dataset: RoadDamageDataset | Subset) -> dict[int, int]:
+    if isinstance(dataset, Subset):
+        samples = (dataset.dataset.samples[index] for index in dataset.indices)
+    else:
+        samples = dataset.samples
+
+    counts: dict[int, int] = {}
+    for sample in samples:
+        for label in sample.get("labels", []):
+            counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: SPEM prototype discovery (Section 3.2–3.3)
 # ---------------------------------------------------------------------------
@@ -201,9 +214,13 @@ def train_ssl_pretraining(
     )
 
     # --- Optimiser ----------------------------------------------------------
+    # A trainable linear-MMD projection has the trivial solution of collapsing
+    # its own output. Keep it fixed so DAPA must update prompt-conditioned features.
+    alignment_head.requires_grad_(False)
+    alignment_head.eval()
+    assert not any(parameter.requires_grad for parameter in alignment_head.parameters())
     trainable = (
         list(ssl_heads.parameters())
-        + list(alignment_head.parameters())
         + list(prompt_projector.parameters())
     )
     optimizer = AdamW(
@@ -236,7 +253,7 @@ def train_ssl_pretraining(
 
     for epoch in range(total_epochs):
         ssl_heads.train()
-        alignment_head.train()
+        alignment_head.eval()
         model.train()
         model.backbone.freeze_backbone()
 
@@ -415,19 +432,14 @@ def train_detection_head(
     )
 
     # --- Label sanity check & class distribution ----------------------------
-    source_label_counts: dict[int, int] = {}
-    source_unique = set()
-    for _, target in source_dataset:
-        for lbl in target["labels"].tolist():
-            source_label_counts[lbl] = source_label_counts.get(lbl, 0) + 1
-            source_unique.add(lbl)
-    val_label_counts: dict[int, int] = {}
-    val_unique = set()
-    if source_val_dataset is not None:
-        for _, target in source_val_dataset:
-            for lbl in target["labels"].tolist():
-                val_label_counts[lbl] = val_label_counts.get(lbl, 0) + 1
-                val_unique.add(lbl)
+    source_label_counts = _label_counts(source_dataset)
+    source_unique = set(source_label_counts)
+    val_label_counts = (
+        _label_counts(source_val_dataset)
+        if source_val_dataset is not None
+        else {}
+    )
+    val_unique = set(val_label_counts)
 
     print(
         f"Source train labels: {sorted(source_unique)}  |  "
@@ -445,11 +457,37 @@ def train_detection_head(
     if extra_s or extra_v:
         print(f"  WARNING: labels outside [0,{num_classes-1}] — source:{sorted(extra_s)} val:{sorted(extra_v)}")
 
-    # --- Optimiser (detection head only) ------------------------------------
+    # --- Optimiser ----------------------------------------------------------
     det_cfg = cfg.get("detection_optim", {})
+    train_prompt_projector = bool(
+        det_cfg.get("train_prompt_projector", False)
+    )
+    model.backbone.freeze_backbone()
+    model.backbone.prompt_projector.requires_grad_(train_prompt_projector)
+    assert not any(parameter.requires_grad for parameter in model.backbone.vit.parameters())
+
+    detection_lr = det_cfg.get("lr", 1e-4)
+    detection_parameters = list(model.detection_head.parameters())
+    trainable_parameters = detection_parameters.copy()
+    parameter_groups = [{"params": detection_parameters, "lr": detection_lr}]
+    if train_prompt_projector:
+        prompt_parameters = list(model.backbone.prompt_projector.parameters())
+        trainable_parameters += prompt_parameters
+        parameter_groups.append({
+            "params": prompt_parameters,
+            "lr": det_cfg.get("prompt_lr", detection_lr * 0.1),
+        })
+    parameter_ids = [
+        id(parameter)
+        for group in parameter_groups
+        for parameter in group["params"]
+    ]
+    assert len(parameter_ids) == len(set(parameter_ids))
+    assert all(parameter.requires_grad for parameter in trainable_parameters)
+
     optimizer = AdamW(
-        model.detection_head.parameters(),
-        lr=det_cfg.get("lr", 1e-4),
+        parameter_groups,
+        lr=detection_lr,
         weight_decay=det_cfg.get("weight_decay", 1e-4),
     )
     warmup_epochs = det_cfg.get("warmup_epochs", 0)
@@ -490,11 +528,6 @@ def train_detection_head(
     grad_accum = args.grad_accum
     effective_batch = cfg["data"]["batch_size"] * grad_accum
 
-    # Freeze backbone
-    model.backbone.freeze_backbone()
-    for param in model.backbone.parameters():
-        param.requires_grad = False
-
     use_amp = device.type == "cuda"
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     amp_enabled = use_amp and not args.no_amp
@@ -505,7 +538,8 @@ def train_detection_head(
           f"grad_accum: {grad_accum}  |  effective batch: {effective_batch}"
           f"  |  AMP: {amp_enabled} ({amp_dtype})"
           f"  |  GradScaler: {scaler.is_enabled()}"
-          f"  |  centerness: {use_centerness}")
+          f"  |  centerness: {use_centerness}"
+          f"  |  prompt tuning: {train_prompt_projector}")
 
     # Keep the registered module unwrapped so checkpoints have stable keys.
     head_for_forward = model.detection_head
@@ -530,6 +564,7 @@ def train_detection_head(
 
     for epoch in range(total_epochs):
         model.detection_head.train()
+        model.backbone.prompt_projector.train(train_prompt_projector)
         optimizer.zero_grad(set_to_none=True)
         epoch_losses = {"cls": 0.0, "box": 0.0, "ctr": 0.0, "total": 0.0}
         steps = 0
@@ -559,7 +594,7 @@ def train_detection_head(
             if (batch_idx + 1) % grad_accum == 0:
                 scaler.unscale_(optimizer)  # needed before clip_grad_norm for fp16
                 torch.nn.utils.clip_grad_norm_(
-                    model.detection_head.parameters(), max_norm=grad_clip
+                    trainable_parameters, max_norm=grad_clip
                 )
                 scaler.step(optimizer)
                 scaler.update()
@@ -582,7 +617,7 @@ def train_detection_head(
         if steps % grad_accum != 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
-                model.detection_head.parameters(), max_norm=grad_clip
+                trainable_parameters, max_norm=grad_clip
             )
             scaler.step(optimizer)
             scaler.update()
@@ -786,6 +821,7 @@ def main() -> None:
     backbone = PromptEnhancedViT(
         vit, prompt_projector,
         injection_layers=tuple(cfg["spem"]["injection_layers"]),
+        detection_layers=tuple(cfg["backbone"].get("detection_layers", ())),
     )
     det_use_ctr = cfg.get("detection_optim", {}).get("ctr_weight", 1.0) > 0.0
     detection_head = LightweightDetectionHead(

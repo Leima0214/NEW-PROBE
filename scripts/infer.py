@@ -83,6 +83,7 @@ def main() -> None:
     backbone = PromptEnhancedViT(
         vit, prompt_projector,
         injection_layers=tuple(cfg["spem"]["injection_layers"]),
+        detection_layers=tuple(cfg["backbone"].get("detection_layers", ())),
     )
     det_cfg = cfg.get("detection_optim", {})
     use_centerness = det_cfg.get("ctr_weight", 0.0) > 0.0
