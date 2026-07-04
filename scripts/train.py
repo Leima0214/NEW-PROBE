@@ -462,9 +462,18 @@ def train_detection_head(
     train_prompt_projector = bool(
         det_cfg.get("train_prompt_projector", False)
     )
+    train_vit_last_n = int(det_cfg.get("train_vit_last_n", 0))
+    if not 0 <= train_vit_last_n <= len(model.backbone.vit.blocks):
+        raise ValueError("detection_optim.train_vit_last_n is out of range.")
     model.backbone.freeze_backbone()
     model.backbone.prompt_projector.requires_grad_(train_prompt_projector)
-    assert not any(parameter.requires_grad for parameter in model.backbone.vit.parameters())
+    vit_parameters = []
+    if train_vit_last_n:
+        for block in model.backbone.vit.blocks[-train_vit_last_n:]:
+            block.requires_grad_(True)
+            vit_parameters += list(block.parameters())
+        model.backbone.vit.norm.requires_grad_(True)
+        vit_parameters += list(model.backbone.vit.norm.parameters())
 
     detection_lr = det_cfg.get("lr", 1e-4)
     detection_parameters = list(model.detection_head.parameters())
@@ -476,6 +485,12 @@ def train_detection_head(
         parameter_groups.append({
             "params": prompt_parameters,
             "lr": det_cfg.get("prompt_lr", detection_lr * 0.1),
+        })
+    if vit_parameters:
+        trainable_parameters += vit_parameters
+        parameter_groups.append({
+            "params": vit_parameters,
+            "lr": det_cfg.get("backbone_lr", detection_lr * 0.01),
         })
     parameter_ids = [
         id(parameter)
@@ -539,7 +554,8 @@ def train_detection_head(
           f"  |  AMP: {amp_enabled} ({amp_dtype})"
           f"  |  GradScaler: {scaler.is_enabled()}"
           f"  |  centerness: {use_centerness}"
-          f"  |  prompt tuning: {train_prompt_projector}")
+          f"  |  prompt tuning: {train_prompt_projector}"
+          f"  |  train ViT blocks: {train_vit_last_n}")
 
     # Keep the registered module unwrapped so checkpoints have stable keys.
     head_for_forward = model.detection_head
@@ -565,6 +581,10 @@ def train_detection_head(
     for epoch in range(total_epochs):
         model.detection_head.train()
         model.backbone.prompt_projector.train(train_prompt_projector)
+        if train_vit_last_n:
+            for block in model.backbone.vit.blocks[-train_vit_last_n:]:
+                block.train()
+            model.backbone.vit.norm.train()
         optimizer.zero_grad(set_to_none=True)
         epoch_losses = {"cls": 0.0, "box": 0.0, "ctr": 0.0, "total": 0.0}
         steps = 0

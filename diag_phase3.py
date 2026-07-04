@@ -1,146 +1,138 @@
-"""Self-diagnostic: evaluate Phase 3 model on its OWN training data.
+"""Evaluate any Phase 3 checkpoint on a configured manifest."""
+from __future__ import annotations
 
-If mAP on source (same-domain) is near 0, the detection head code has a bug.
-If mAP on source is reasonable (>0.2), the issue is cross-domain features from Phase 2.
-"""
-import sys, yaml, torch, timm
+import argparse
+import sys
 from pathlib import Path
+
+import timm
+import torch
+import torchvision.transforms as T
+import yaml
+
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from probe.models import (PROBEModel, PromptEnhancedViT, PromptProjector,
-                          LightweightDetectionHead, PrototypeState)
 from probe.data.road_damage import RoadDamageDataset
-from probe.engine.detection import (generate_grid, collect_detections,
-                                    apply_nms, evaluate_map)
-import torchvision.transforms as T
-
-DEVICE = torch.device("cuda")
-IMAGE_SIZE = 512
-STRIDE = 16.0
-FEATURE_SIZE = IMAGE_SIZE // 16
-NUM_SAMPLES = 200  # evaluate on first 200 training images
-
-# ── Load config & model ──────────────────────────────────────────
-cfg = yaml.safe_load(open(ROOT / "configs/probe_a100.yaml"))
-
-print("Loading ViT ...")
-vit = timm.create_model(cfg["backbone"]["name"], pretrained=False, img_size=IMAGE_SIZE)
-vit.reset_classifier(0)
-
-print("Loading Phase 2 checkpoint ...")
-# Try Phase 3 checkpoint first (trained head), fall back to Phase 2
-det_ckpt_path = ROOT / "checkpoints/probe_det_best.pt"
-if det_ckpt_path.exists():
-    ckpt = torch.load(det_ckpt_path, map_location=DEVICE, weights_only=False)
-    print(f"Loading Phase 3 detection checkpoint: {det_ckpt_path}")
-else:
-    ckpt = torch.load(ROOT / "checkpoints/probe_final.pt", map_location=DEVICE, weights_only=False)
-    print("Loading Phase 2 checkpoint (detection head will be UNTRAINED!)")
-
-prompt_projector = PromptProjector(50, 768, 256)
-backbone = PromptEnhancedViT(
-    vit,
-    prompt_projector,
-    injection_layers=(0, 6),
-    detection_layers=tuple(cfg["backbone"].get("detection_layers", ())),
+from probe.engine.detection import evaluate_map, generate_grid
+from probe.models import (
+    LightweightDetectionHead,
+    PROBEModel,
+    PromptEnhancedViT,
+    PromptProjector,
+    PrototypeState,
 )
 
-det_cfg = cfg.get("detection_optim", {})
-use_ctr = det_cfg.get("ctr_weight", 1.0) > 0.0
-det_head = LightweightDetectionHead(
-    768, cfg["detection"]["hidden_dim"],
-    cfg["detection"]["num_classes"],
-    cls_prior=cfg["detection"].get("cls_prior", 0.01),
-    use_centerness=use_ctr,
-    architecture=cfg["detection"].get(
-        "architecture", "fcos" if use_ctr else "paper"
-    ),
-    paper_mid_dim=cfg["detection"].get("paper_mid_dim", 384),
-    paper_neck_dim=cfg["detection"].get("paper_neck_dim", 128),
-)
-model = PROBEModel(backbone, det_head).to(DEVICE)
 
-# Load full model (backbone + detection head if in checkpoint)
-# Strip _orig_mod. prefix from torch.compile-wrapped checkpoints
-model_state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
-det_keys_ckpt = {k for k in model_state if "detection_head" in k}
-det_keys_model = {k for k in model.state_dict() if "detection_head" in k}
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/probe_a100.yaml")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--manifest-key",
+        default="source_manifest",
+        choices=("source_manifest", "source_val_manifest", "target_manifest", "val_manifest"),
+    )
+    parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--image-size", type=int, default=512)
+    args = parser.parse_args()
 
-print(f"  Detection head keys in checkpoint: {len(det_keys_ckpt)}")
-print(f"  Detection head keys in model:      {len(det_keys_model)}")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    with open(args.config, encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
-# Check shape mismatches
-mismatches = []
-for k in sorted(det_keys_ckpt & det_keys_model):
-    if model_state[k].shape != model.state_dict()[k].shape:
-        mismatches.append(f"    {k}: ckpt={list(model_state[k].shape)} vs model={list(model.state_dict()[k].shape)}")
-if mismatches:
-    print("  SHAPE MISMATCHES:")
-    for m in mismatches[:10]:
-        print(m)
-    if len(mismatches) > 10:
-        print(f"    ... and {len(mismatches)-10} more")
+    vit = timm.create_model(
+        cfg["backbone"]["name"], pretrained=False, img_size=args.image_size
+    )
+    vit.reset_classifier(0)
+    prompt_projector = PromptProjector(
+        cfg["spem"]["pca_dim"],
+        cfg["backbone"]["embed_dim"],
+        cfg["spem"]["prompt_hidden_dim"],
+    )
+    backbone = PromptEnhancedViT(
+        vit,
+        prompt_projector,
+        injection_layers=tuple(cfg["spem"]["injection_layers"]),
+        detection_layers=tuple(cfg["backbone"].get("detection_layers", ())),
+    )
+    det_cfg = cfg.get("detection_optim", {})
+    use_centerness = det_cfg.get("ctr_weight", 0.0) > 0.0
+    detection_head = LightweightDetectionHead(
+        embed_dim=cfg["backbone"]["embed_dim"],
+        hidden_dim=cfg["detection"]["hidden_dim"],
+        num_classes=cfg["detection"]["num_classes"],
+        cls_prior=cfg["detection"].get("cls_prior", 0.01),
+        head_depth=cfg["detection"].get("head_depth", 3),
+        use_centerness=use_centerness,
+        architecture=cfg["detection"].get(
+            "architecture", "fcos" if use_centerness else "paper"
+        ),
+        paper_mid_dim=cfg["detection"].get("paper_mid_dim", 384),
+        paper_neck_dim=cfg["detection"].get("paper_neck_dim", 128),
+    )
+    model = PROBEModel(backbone, detection_head).to(device)
+    state = {
+        key.replace("_orig_mod.", ""): value
+        for key, value in checkpoint["model"].items()
+    }
+    model.load_state_dict(state, strict=True)
 
-missing, unexpected = model.load_state_dict(model_state, strict=False)
-has_head = any("detection_head" in k for k in model_state)
-print(f"  Loaded (missing: {len(missing)}, unexpected: {len(unexpected)})"
-      f"  |  head_in_ckpt: {has_head}")
+    stored = checkpoint["prototype_state"]
+    prototype_state = PrototypeState(
+        stored["mean"].to(device) if isinstance(stored, dict) else stored.mean.to(device),
+        stored["components"].to(device)
+        if isinstance(stored, dict)
+        else stored.components.to(device),
+        stored["centroids"].to(device)
+        if isinstance(stored, dict)
+        else stored.centroids.to(device),
+    )
+    transform = T.Compose(
+        [
+            T.Resize((args.image_size, args.image_size)),
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ]
+    )
+    manifest = cfg["data"][args.manifest_key]
+    dataset = RoadDamageDataset(
+        manifest,
+        cfg["data"]["image_root"],
+        transform=transform,
+        image_size=args.image_size,
+        num_classes=cfg["detection"]["num_classes"],
+    )
+    feature_size = args.image_size // 16
+    metrics = evaluate_map(
+        model,
+        dataset,
+        prototype_state,
+        device,
+        generate_grid(feature_size, args.image_size / feature_size, device),
+        args.image_size / feature_size,
+        num_classes=cfg["detection"]["num_classes"],
+        score_threshold=det_cfg.get("score_threshold", 0.05),
+        nms_threshold=det_cfg.get("nms_threshold", 0.5),
+        image_size=args.image_size,
+        max_samples=args.max_samples,
+        use_centerness=use_centerness,
+        box_mode=det_cfg.get(
+            "box_mode", "ltrb" if use_centerness else "center_size"
+        ),
+    )
+    print(f"manifest: {manifest} ({min(len(dataset), args.max_samples or len(dataset))} images)")
+    print(f"mAP@50: {metrics['mAP@0.5'] * 100:.2f}%")
+    print(f"mAP@[.5:.95]: {metrics['mAP@[.5:.95]'] * 100:.2f}%")
+    for key, value in sorted(metrics.items()):
+        if key.startswith("AP_cls_"):
+            print(f"{key}: {'n/a' if value is None else f'{value * 100:.2f}%'}")
 
-# Load prototype state
-ps = ckpt["prototype_state"]
-if isinstance(ps, dict):
-    # legacy dict format
-    prototype_state = PrototypeState(ps["mean"].to(DEVICE), ps["components"].to(DEVICE),
-                                     ps["centroids"].to(DEVICE))
-else:
-    prototype_state = PrototypeState(ps.mean.to(DEVICE), ps.components.to(DEVICE),
-                                     ps.centroids.to(DEVICE))
 
-model.eval()
-locations = generate_grid(FEATURE_SIZE, STRIDE, DEVICE)
-
-# ── Evaluate on SOURCE training data ─────────────────────────────
-transform = T.Compose([
-    T.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-    T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
-
-print(f"\nEvaluating on source training data ({NUM_SAMPLES} images) ...")
-src_dataset = RoadDamageDataset(
-    cfg["data"]["source_manifest"],
-    cfg["data"]["image_root"],
-    transform=transform, image_size=IMAGE_SIZE,
-)
-
-metrics = evaluate_map(
-    model, src_dataset, prototype_state, DEVICE,
-    locations, STRIDE,
-    num_classes=cfg["detection"]["num_classes"],
-    score_threshold=det_cfg.get("score_threshold", 0.005),
-    nms_threshold=det_cfg.get("nms_threshold", 0.5),
-    image_size=IMAGE_SIZE,
-    max_samples=NUM_SAMPLES,
-    use_centerness=use_ctr,
-    box_mode=det_cfg.get("box_mode", "ltrb" if use_ctr else "center_size"),
-)
-
-print(f"\n{'='*60}")
-print(f"SOURCE-DOMAIN mAP@0.5: {metrics['mAP@0.5']:.4f}")
-for k, v in sorted(metrics.items()):
-    if k.startswith("AP_cls_"):
-        label = "n/a" if v is None else f"{v:.4f}"
-        print(f"  {k}: {label}")
-print(f"{'='*60}")
-
-if metrics["mAP@0.5"] < 0.05:
-    print("\n⚠️  mAP < 0.05 on TRAINING data → DETECTION HEAD CODE HAS A BUG")
-    print("   The model cannot detect objects even in its own training domain.")
-elif metrics["mAP@0.5"] < 0.20:
-    print("\n⚠️  mAP 0.05-0.20 on training data → Detection head is weak but functional")
-    print("   Check label assignment, loss weights, or learning rate.")
-else:
-    print("\nSource-domain fitting is functional (mAP > 0.20).")
-    print("This verifies checkpoint loading and basic fitting only; it does not")
-    print("prove paper alignment or rule out data, metric, and transfer defects.")
+if __name__ == "__main__":
+    main()
