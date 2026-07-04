@@ -156,3 +156,51 @@ AdaBN harms both domains and is stopped.
    target errors. The next implementation must use an EMA teacher with
    weak/strong consistency and an explicit mechanism for class-distribution
    and localization quality, while preserving the strong source detector.
+
+## Completed 100-epoch 640px source baseline
+
+Saved under `checkpoints/yolov8s_japan_100e_640/`.
+
+| Metric | Result |
+|---|---:|
+| Best Japan mAP@50 (epoch 49) | 53.09% |
+| Best Japan mAP@[.5:.95] | 24.13% |
+| Final Japan mAP@50 (epoch 100) | 49.92% |
+| Czech zero-shot mAP@50 | 11.10% |
+| Czech zero-shot mAP@[.5:.95] | 3.97% |
+
+Czech class AP@50:
+
+- longitudinal: 19.8%
+- transverse: 12.8%
+- alligator: 10.4%
+- pothole: 1.4%
+
+The shorter 30-epoch 512px source model remains the stronger cross-domain
+teacher (13.50% Czech mAP@50). Longer source training and higher resolution
+increase source specialization but do not improve transfer.
+
+## Next experiment gates
+
+1. Train a 100-epoch 640px Czech-supervised oracle for diagnosis only. If its
+   mAP@50 remains below 50%, a 50% zero-shot target is not a defensible goal
+   under the current manifests and evaluation protocol; resolve the paper's
+   split/protocol mismatch before further architecture work.
+2. Keep `yolov8s_japan/weights/best.pt` (30 epochs, 512px) as the zero-shot
+   teacher baseline because it has the best verified Czech result (13.50%).
+3. Implement quality-aware EMA consistency:
+   - weak-view EMA teacher and strong-view student;
+   - require agreement across two teacher views for class and box location;
+   - class-adaptive confidence thresholds;
+   - ignore uncertain target regions instead of treating them as background;
+   - retain labeled Japan batches to prevent catastrophic forgetting;
+   - ramp target consistency weight from zero.
+4. Run a 10-epoch smoke experiment. Continue only if Japan mAP@50 stays above
+   50% and Czech mAP@50 exceeds 13.50%.
+5. Add non-collapsing multi-level feature alignment only after the EMA gate
+   passes. Compare fixed random projection, covariance alignment, and
+   stop-gradient teacher features one at a time.
+6. Three-seed long runs are justified only after a single seed exceeds 20%
+   Czech mAP@50. Report 50% as achieved only on the untouched Czech validation
+   set without using its labels for training, threshold selection, or
+   checkpoint selection.
