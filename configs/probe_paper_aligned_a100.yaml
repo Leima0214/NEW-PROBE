@@ -1,0 +1,71 @@
+# Paper-aligned Japan-to-Czech reproduction.
+# Phase 2: --phase 2 --image-size 224 --spem-samples 2260
+# Phase 3: --phase 3 --image-size 512 --resume <phase-2 checkpoint>
+seed: 42
+device: cuda
+
+backbone:
+  name: vit_base_patch16_224
+  embed_dim: 768
+  frozen: true
+  detection_layers: []
+
+spem:
+  pca_dim: 50
+  num_prototypes: 10
+  kmeans_iters: 300
+  prompt_hidden_dim: 192
+  injection_layers: [0, 6]
+  prompt_temperature: 0.2
+  prompt_weight: 1.0
+
+dapa:
+  projection_dim: 256
+  weight: 0.5
+
+ssl:
+  hidden_dim: 2048
+  out_dim: 2048
+
+detection:
+  num_classes: 4
+  architecture: paper
+  paper_mid_dim: 384
+  paper_neck_dim: 128
+  hidden_dim: 256
+  head_depth: 3
+  source_label_fraction: 0.0595238095  # 500 / 8400 Japan training images
+  cls_prior: 0.01
+
+detection_optim:
+  lr: 0.0001
+  lr_min: 0.0
+  weight_decay: 0.0001
+  epochs: 50
+  warmup_epochs: 0
+  grad_clip: 1.0
+  train_prompt_projector: false
+  train_vit_last_n: 0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  box_weight: 1.0
+  ctr_weight: 0.0
+  box_mode: center_size
+  score_threshold: 0.05
+  nms_threshold: 0.5
+  val_interval: 5
+  center_sampling_radius: 1.0
+
+optim:
+  lr: 0.0005
+  weight_decay: 0.05
+  pretrain_epochs: 200
+
+data:
+  source_manifest: /PROBE/data/japan_train.jsonl
+  source_val_manifest: /PROBE/data/japan_val.jsonl
+  target_manifest: /PROBE/data/czech_train.jsonl
+  val_manifest: /PROBE/data/czech_val.jsonl
+  image_root: /PROBE/data/images
+  batch_size: 64
+  num_workers: 4

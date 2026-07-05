@@ -77,6 +77,14 @@ def simsiam_transform(image_size: int = 512) -> T.Compose:
     ])
 
 
+class TwoViewTransform:
+    def __init__(self, transform) -> None:
+        self.transform = transform
+
+    def __call__(self, image):
+        return self.transform(image), self.transform(image)
+
+
 def eval_transform(image_size: int = 512) -> T.Compose:
     """Simple resize + normalise transform for evaluation."""
     return T.Compose([
@@ -95,12 +103,36 @@ def _unwrap_state_dict(state_dict: dict) -> dict:
     return {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 
 
+def _compatible_state_dict(
+    model: nn.Module,
+    state_dict: dict,
+    excluded_prefixes: tuple[str, ...] = (),
+) -> tuple[dict, list[str]]:
+    """Keep checkpoint tensors that exist in the model with the same shape."""
+    expected = model.state_dict()
+    compatible, skipped = {}, []
+    for key, value in _unwrap_state_dict(state_dict).items():
+        if key.startswith(excluded_prefixes):
+            continue
+        if key not in expected or expected[key].shape != value.shape:
+            skipped.append(key)
+            continue
+        compatible[key] = value
+    return compatible, skipped
+
+
 def detection_collate(batch: list) -> tuple:
     """Collate variable-size detection targets (boxes/labels differ per image)."""
     images, targets = zip(*batch)
     if isinstance(images[0], torch.Tensor):
         images = torch.stack(images, 0)
     return images, targets
+
+
+def ssl_collate(batch: list) -> tuple:
+    views, targets = zip(*batch)
+    view1, view2 = zip(*views)
+    return (torch.stack(view1), torch.stack(view2)), targets
 
 
 def _label_counts(dataset: RoadDamageDataset | Subset) -> dict[int, int]:
@@ -181,36 +213,45 @@ def train_ssl_pretraining(
     print("=" * 60)
 
     image_size = args.image_size
+    two_views = TwoViewTransform(simsiam_transform(image_size))
 
     # --- Datasets -----------------------------------------------------------
     source_dataset = RoadDamageDataset(
         cfg["data"]["source_manifest"],
         cfg["data"]["image_root"],
-        transform=eval_transform(image_size),
+        transform=two_views,
         image_size=image_size,
     )
     target_ssl_dataset = RoadDamageDataset(
         cfg["data"]["target_manifest"],
         cfg["data"]["image_root"],
+        transform=two_views,
         image_size=image_size,
+        unlabeled=True,
     )
 
     batch_size = cfg["data"]["batch_size"]
+    num_workers = cfg["data"]["num_workers"]
+    loader_options = {
+        "num_workers": num_workers,
+        "persistent_workers": num_workers > 0,
+        "pin_memory": device.type == "cuda",
+    }
     source_loader = DataLoader(
         source_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=cfg["data"]["num_workers"],
         drop_last=True,
-        collate_fn=detection_collate,
+        collate_fn=ssl_collate,
+        **loader_options,
     )
     target_loader = DataLoader(
         target_ssl_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=cfg["data"]["num_workers"],
         drop_last=True,
-        collate_fn=detection_collate,
+        collate_fn=ssl_collate,
+        **loader_options,
     )
 
     # --- Optimiser ----------------------------------------------------------
@@ -238,7 +279,6 @@ def train_ssl_pretraining(
     amp_enabled = use_amp and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_enabled and amp_dtype == torch.float16))
 
-    ssl_aug = simsiam_transform(image_size)
     prompt_weight = cfg["spem"]["prompt_weight"]
     dapa_weight = cfg["dapa"]["weight"]
     prompt_temperature = cfg["spem"]["prompt_temperature"]
@@ -261,20 +301,21 @@ def train_ssl_pretraining(
         optimizer.zero_grad(set_to_none=True)
         steps = 0
 
-        for step, (source_batch, (target_imgs, _)) in enumerate(
+        for step, ((source_views, _), (target_views, _)) in enumerate(
             zip(source_loader, target_loader)
         ):
-            source_images, _ = source_batch
-            source_images = source_images.to(device)
-
-            # Two independent SimSiam views of each target image
-            target_view1 = torch.stack([ssl_aug(img) for img in target_imgs]).to(device)
-            target_view2 = torch.stack([ssl_aug(img) for img in target_imgs]).to(device)
+            # Algorithm 1 applies SimSiam to both source and target domains.
+            source_view1, source_view2 = (
+                view.to(device, non_blocking=True) for view in source_views
+            )
+            target_view1, target_view2 = (
+                view.to(device, non_blocking=True) for view in target_views
+            )
 
             with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 metrics = probe_pretrain_step(
                     model, ssl_heads, alignment_head,
-                    source_images, target_view1, target_view2,
+                    source_view1, source_view2, target_view1, target_view2,
                     prototype_state, optimizer,
                     prompt_weight=prompt_weight,
                     dapa_weight=dapa_weight,
@@ -788,6 +829,8 @@ def main() -> None:
                         help="Override Phase 3 detection epochs")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override batch_size from config")
+    parser.add_argument("--image-root", type=str, default=None,
+                        help="Override data.image_root from config")
     parser.add_argument("--grad-accum", type=int, default=1,
                         help="Gradient accumulation steps (simulates larger batch)")
     parser.add_argument("--no-amp", action="store_true", default=False,
@@ -796,8 +839,7 @@ def main() -> None:
                         help="Disable torch.compile (A100: ~20 pct speedup when enabled)")
     parser.add_argument(
         "--phase", type=int, choices=[1, 2, 3], default=None,
-        help="Run only a specific phase "
-             "(3 = detection only, requires --resume)",
+        help="Stop after phase 1 or 2; phase 3 requires --resume",
     )
     parser.add_argument(
         "--resume", type=str, default=None,
@@ -816,6 +858,8 @@ def main() -> None:
 
     if args.batch_size is not None:
         cfg["data"]["batch_size"] = args.batch_size
+    if args.image_root is not None:
+        cfg["data"]["image_root"] = args.image_root
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -875,16 +919,14 @@ def main() -> None:
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
 
         # Load backbone weights only (skip detection head if present)
-        model_state = ckpt["model"]
-        # Also strip _orig_mod. prefix from torch.compile-wrapped checkpoints
-        model_state = {k.replace("_orig_mod.", ""): v for k, v in model_state.items()}
-        filtered_state = {
-            k: v for k, v in model_state.items()
-            if not k.startswith("detection_head.")
-        }
+        filtered_state, skipped = _compatible_state_dict(
+            model,
+            ckpt["model"],
+            excluded_prefixes=("detection_head.",),
+        )
         missing, unexpected = model.load_state_dict(filtered_state, strict=False)
         print(f"  Loaded backbone (missing: {len(missing)}, "
-              f"unexpected: {len(unexpected)})")
+              f"unexpected: {len(unexpected)}, shape-skipped: {len(skipped)})")
 
         prototype_state = ckpt.get("prototype_state")
         if prototype_state is None:
@@ -911,7 +953,7 @@ def main() -> None:
     # ======================================================================
 
     # --- Phase 1: SPEM discovery --------------------------------------------
-    if args.phase is None or args.phase == 1:
+    if args.phase is None or args.phase in (1, 2):
         print("\n" + "=" * 60)
         print("Phase 1: SPEM Prototype Discovery")
         print("=" * 60)
@@ -919,6 +961,7 @@ def main() -> None:
         target_dataset = RoadDamageDataset(
             cfg["data"]["target_manifest"],
             cfg["data"]["image_root"],
+            unlabeled=True,
         )
         prototype_state, _spem_features = discover_prototypes(
             target_dataset,
