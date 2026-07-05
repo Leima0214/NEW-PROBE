@@ -95,6 +95,24 @@ def _unwrap_state_dict(state_dict: dict) -> dict:
     return {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 
 
+def _compatible_state_dict(
+    model: nn.Module,
+    state_dict: dict,
+    excluded_prefixes: tuple[str, ...] = (),
+) -> tuple[dict, list[str]]:
+    """Keep checkpoint tensors that exist in the model with the same shape."""
+    expected = model.state_dict()
+    compatible, skipped = {}, []
+    for key, value in _unwrap_state_dict(state_dict).items():
+        if key.startswith(excluded_prefixes):
+            continue
+        if key not in expected or expected[key].shape != value.shape:
+            skipped.append(key)
+            continue
+        compatible[key] = value
+    return compatible, skipped
+
+
 def detection_collate(batch: list) -> tuple:
     """Collate variable-size detection targets (boxes/labels differ per image)."""
     images, targets = zip(*batch)
@@ -192,6 +210,7 @@ def train_ssl_pretraining(
         cfg["data"]["target_manifest"],
         cfg["data"]["image_root"],
         image_size=image_size,
+        unlabeled=True,
     )
 
     batch_size = cfg["data"]["batch_size"]
@@ -873,16 +892,14 @@ def main() -> None:
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
 
         # Load backbone weights only (skip detection head if present)
-        model_state = ckpt["model"]
-        # Also strip _orig_mod. prefix from torch.compile-wrapped checkpoints
-        model_state = {k.replace("_orig_mod.", ""): v for k, v in model_state.items()}
-        filtered_state = {
-            k: v for k, v in model_state.items()
-            if not k.startswith("detection_head.")
-        }
+        filtered_state, skipped = _compatible_state_dict(
+            model,
+            ckpt["model"],
+            excluded_prefixes=("detection_head.",),
+        )
         missing, unexpected = model.load_state_dict(filtered_state, strict=False)
         print(f"  Loaded backbone (missing: {len(missing)}, "
-              f"unexpected: {len(unexpected)})")
+              f"unexpected: {len(unexpected)}, shape-skipped: {len(skipped)})")
 
         prototype_state = ckpt.get("prototype_state")
         if prototype_state is None:
@@ -917,6 +934,7 @@ def main() -> None:
         target_dataset = RoadDamageDataset(
             cfg["data"]["target_manifest"],
             cfg["data"]["image_root"],
+            unlabeled=True,
         )
         prototype_state, _spem_features = discover_prototypes(
             target_dataset,

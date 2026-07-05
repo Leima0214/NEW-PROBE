@@ -96,6 +96,28 @@ class DetectionDataTests(unittest.TestCase):
             self.assertEqual(tuple(target["boxes"].shape), (0, 4))
             self.assertEqual(tuple(target["labels"].shape), (0,))
 
+    def test_unlabeled_mode_discards_manifest_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            Image.new("RGB", (32, 32)).save(root / "sample.jpg")
+            manifest = root / "samples.jsonl"
+            manifest.write_text(
+                json.dumps({
+                    "image": "sample.jpg",
+                    "boxes": [[1, 2, 10, 12]],
+                    "labels": [3],
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+            dataset = RoadDamageDataset(manifest, root, unlabeled=True)
+
+            _, target = dataset[0]
+
+            self.assertEqual(dataset.samples, [{"image": "sample.jpg"}])
+            self.assertEqual(target["boxes"].numel(), 0)
+            self.assertEqual(target["labels"].numel(), 0)
+
 
 class DetectionModelTests(unittest.TestCase):
     def test_backbone_averages_requested_detection_layers(self) -> None:

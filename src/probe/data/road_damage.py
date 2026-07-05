@@ -25,6 +25,7 @@ class RoadDamageDataset(Dataset):
         joint_transform: Callable | None = None,
         image_size: int | None = None,
         num_classes: int | None = None,
+        unlabeled: bool = False,
     ) -> None:
         self.image_root = Path(image_root)
         self.transform = transform
@@ -32,7 +33,12 @@ class RoadDamageDataset(Dataset):
         self.image_size = image_size
         self.num_classes = num_classes
         with Path(manifest).open("r", encoding="utf-8") as handle:
-            self.samples = [json.loads(line) for line in handle if line.strip()]
+            samples = [json.loads(line) for line in handle if line.strip()]
+        self.samples = (
+            [{"image": sample["image"]} for sample in samples]
+            if unlabeled
+            else samples
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
