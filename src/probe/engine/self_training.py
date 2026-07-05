@@ -83,7 +83,8 @@ def probe_pretrain_step(
     model,
     ssl_heads: SimSiamHeads,
     alignment_head: DomainAlignmentHead,
-    source_images: torch.Tensor,
+    source_view1: torch.Tensor,
+    source_view2: torch.Tensor,
     target_view1: torch.Tensor,
     target_view2: torch.Tensor,
     prototype_state: PrototypeState,
@@ -106,16 +107,20 @@ def probe_pretrain_step(
     When scaler is provided (fp16 AMP), backward goes through GradScaler.
     """
 
-    source_features, _, _ = model.encode(source_images, prototype_state)
+    source_features1, _, _ = model.encode(source_view1, prototype_state)
+    source_features2, _, _ = model.encode(source_view2, prototype_state)
     target_features1, _, target_prompts1 = model.encode(target_view1, prototype_state)
     target_features2, _, _ = model.encode(target_view2, prototype_state)
 
-    loss_ssl = simsiam_loss(ssl_heads, target_features1, target_features2)
+    loss_ssl = 0.5 * (
+        simsiam_loss(ssl_heads, source_features1, source_features2)
+        + simsiam_loss(ssl_heads, target_features1, target_features2)
+    )
     loss_prompt = PromptConsistencyLoss(prompt_temperature)(
         target_features1,
         target_prompts1,
     )
-    loss_dapa = linear_mmd_loss(alignment_head, source_features, target_features1)
+    loss_dapa = linear_mmd_loss(alignment_head, source_features1, target_features1)
     loss = loss_ssl + prompt_weight * loss_prompt + dapa_weight * loss_dapa
     loss = loss / grad_accum
 

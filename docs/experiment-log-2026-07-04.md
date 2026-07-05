@@ -204,3 +204,56 @@ increase source specialization but do not improve transfer.
    Czech mAP@50. Report 50% as achieved only on the untouched Czech validation
    set without using its labels for training, threshold selection, or
    checkpoint selection.
+
+## Follow-up - 2026-07-05
+
+### Environment and protocol verification
+
+- Remote: `root@xj-member.bitahub.com:42194`
+- GPU: NVIDIA A100-SXM4 80GB
+- Runtime: PyTorch 2.5.1+cu124, Ultralytics 8.4.87
+- Project tests: 11 passed
+- The saved Japan 100e/640 checkpoint reproduced exactly on Czech validation:
+  11.10% mAP@50 and 3.97% mAP@[.5:.95].
+
+### Czech supervised oracle
+
+This run is a diagnostic upper bound only. Czech labels were used for both
+training and validation, so it is not a domain-adaptation result.
+
+- Model: YOLOv8-s, ImageNet/COCO pretrained
+- Resolution: 640
+- Batch size: 128
+- Planned epochs: 100
+- Early stopping: epoch 83, with the selected checkpoint from epoch 53
+
+| Metric | Result |
+|---|---:|
+| Czech mAP@50 | 31.44% |
+| Czech mAP@[.5:.95] | 10.83% |
+| longitudinal AP50 | 30.0% |
+| transverse AP50 | 28.6% |
+| alligator AP50 | 42.0% |
+| pothole AP50 | 25.3% |
+
+Even fully supervised target training is 18.56 points below the requested 50%
+under the current manifests and evaluator. Architecture work remains useful,
+but the paper's 88.7% Japan-to-Czech number cannot be treated as directly
+comparable until its split, filtering, class mapping, and evaluation protocol
+are matched.
+
+The authors' referenced repository was checked again on 2026-07-05:
+`https://github.com/xixiaouab/PROBE`, commit `f899bc6`. It contains only the
+core scaffold on one branch, with no tags. Its README explicitly states that
+the final checkpoints, dataset scripts, and exact benchmark recipes will be
+released separately. GitHub therefore does not currently provide the missing
+artifacts needed to reproduce the paper's 88.7% result.
+
+### Quality-aware pseudo-label change
+
+`scripts/build_pseudo_dataset.py` now optionally requires agreement between
+two teacher prediction views. Predictions must agree on class and box IoU;
+matched boxes and confidences are fused before the existing per-class Top-K
+selection. Uncertain target images are omitted rather than trained as
+background. The mixed dataset retains all labeled Japan images, and the
+student's EMA checkpoint becomes the next teacher.

@@ -186,7 +186,6 @@ def train_ssl_pretraining(
     source_dataset = RoadDamageDataset(
         cfg["data"]["source_manifest"],
         cfg["data"]["image_root"],
-        transform=eval_transform(image_size),
         image_size=image_size,
     )
     target_ssl_dataset = RoadDamageDataset(
@@ -261,20 +260,19 @@ def train_ssl_pretraining(
         optimizer.zero_grad(set_to_none=True)
         steps = 0
 
-        for step, (source_batch, (target_imgs, _)) in enumerate(
+        for step, ((source_imgs, _), (target_imgs, _)) in enumerate(
             zip(source_loader, target_loader)
         ):
-            source_images, _ = source_batch
-            source_images = source_images.to(device)
-
-            # Two independent SimSiam views of each target image
+            # Algorithm 1 applies SimSiam to both source and target domains.
+            source_view1 = torch.stack([ssl_aug(img) for img in source_imgs]).to(device)
+            source_view2 = torch.stack([ssl_aug(img) for img in source_imgs]).to(device)
             target_view1 = torch.stack([ssl_aug(img) for img in target_imgs]).to(device)
             target_view2 = torch.stack([ssl_aug(img) for img in target_imgs]).to(device)
 
             with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 metrics = probe_pretrain_step(
                     model, ssl_heads, alignment_head,
-                    source_images, target_view1, target_view2,
+                    source_view1, source_view2, target_view1, target_view2,
                     prototype_state, optimizer,
                     prompt_weight=prompt_weight,
                     dapa_weight=dapa_weight,
