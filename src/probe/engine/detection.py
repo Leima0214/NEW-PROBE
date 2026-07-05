@@ -458,14 +458,23 @@ def _evaluate_detections_at_iou(
             class_aps[class_id] = None
             continue
 
-        matched = [False] * total_gt
+        gts_by_image: dict[int, list[dict]] = {}
+        for gt in gts:
+            gts_by_image.setdefault(gt["image_id"], []).append(gt)
+        matched = {
+            image_id: [False] * len(image_gts)
+            for image_id, image_gts in gts_by_image.items()
+        }
         true_positives: list[int] = []
         false_positives: list[int] = []
         for det in dets:
             best_iou = 0.0
             best_gt_idx = -1
-            for gt_idx, gt in enumerate(gts):
-                if matched[gt_idx] or gt["image_id"] != det["image_id"]:
+            image_id = det["image_id"]
+            image_gts = gts_by_image.get(image_id, [])
+            image_matched = matched.get(image_id, [])
+            for gt_idx, gt in enumerate(image_gts):
+                if image_matched[gt_idx]:
                     continue
                 overlap = compute_iou(det["box"], gt["box"])
                 if overlap > best_iou:
@@ -473,7 +482,7 @@ def _evaluate_detections_at_iou(
                     best_gt_idx = gt_idx
 
             if best_gt_idx >= 0 and best_iou >= iou_threshold:
-                matched[best_gt_idx] = True
+                image_matched[best_gt_idx] = True
                 true_positives.append(1)
                 false_positives.append(0)
             else:
@@ -509,7 +518,7 @@ def evaluate_map(
     stride: float,
     num_classes: int = 5,
     iou_threshold: float = 0.5,
-    score_threshold: float = 0.05,
+    score_threshold: float = 0.001,
     nms_threshold: float = 0.5,
     image_size: int = 512,
     max_samples: Optional[int] = None,

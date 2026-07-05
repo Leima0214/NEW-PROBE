@@ -17,6 +17,7 @@ from probe.engine.detection import (
     compute_interpolated_ap,
     detection_loss,
     encode_boxes,
+    evaluate_map,
     generate_grid,
     sigmoid_focal_loss,
 )
@@ -275,6 +276,40 @@ class DetectionModelTests(unittest.TestCase):
             precisions=[1.0, 1.0],
         )
         self.assertAlmostEqual(ap, 1.0)
+
+    def test_map_keeps_low_confidence_predictions_for_ranking(self) -> None:
+        class Model:
+            def eval(self):
+                return self
+
+            def detect(self, images, prototype_state):
+                size_logit = torch.log(torch.expm1(torch.tensor(0.5)))
+                return {
+                    "class_logits": torch.full((1, 1, 1, 1), -4.59512),
+                    "boxes": torch.tensor([0.0, 0.0, size_logit, size_logit]).reshape(
+                        1, 4, 1, 1
+                    ),
+                }
+
+        dataset = [(
+            torch.zeros(3, 16, 16),
+            {
+                "boxes": torch.tensor([[4.0, 4.0, 12.0, 12.0]]),
+                "labels": torch.tensor([0]),
+            },
+        )]
+        metrics = evaluate_map(
+            Model(),
+            dataset,
+            prototype_state=None,
+            device=torch.device("cpu"),
+            locations=generate_grid(1, 16.0, torch.device("cpu")),
+            stride=16.0,
+            num_classes=1,
+            image_size=16,
+        )
+
+        self.assertAlmostEqual(metrics["mAP@0.5"], 1.0)
 
 
 if __name__ == "__main__":

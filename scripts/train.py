@@ -829,6 +829,8 @@ def main() -> None:
                         help="Override Phase 3 detection epochs")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override batch_size from config")
+    parser.add_argument("--image-root", type=str, default=None,
+                        help="Override data.image_root from config")
     parser.add_argument("--grad-accum", type=int, default=1,
                         help="Gradient accumulation steps (simulates larger batch)")
     parser.add_argument("--no-amp", action="store_true", default=False,
@@ -856,6 +858,8 @@ def main() -> None:
 
     if args.batch_size is not None:
         cfg["data"]["batch_size"] = args.batch_size
+    if args.image_root is not None:
+        cfg["data"]["image_root"] = args.image_root
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")

@@ -38,20 +38,20 @@ detection:
   cls_prior: 0.01
 
 detection_optim:
-  lr: 0.0001
-  lr_min: 0.0
+  lr: 0.001
+  lr_min: 0.000001
   weight_decay: 0.0001
   epochs: 50
-  warmup_epochs: 0
+  warmup_epochs: 5
   grad_clip: 1.0
   train_prompt_projector: false
   train_vit_last_n: 0
   focal_alpha: 0.25
   focal_gamma: 2.0
-  box_weight: 1.0
+  box_weight: 2.0
   ctr_weight: 0.0
   box_mode: center_size
-  score_threshold: 0.05
+  score_threshold: 0.001
   nms_threshold: 0.5
   val_interval: 5
   center_sampling_radius: 1.0
@@ -68,4 +68,4 @@ data:
   val_manifest: /PROBE/data/czech_val.jsonl
   image_root: /PROBE/data/images
   batch_size: 64
-  num_workers: 6
+  num_workers: 4
