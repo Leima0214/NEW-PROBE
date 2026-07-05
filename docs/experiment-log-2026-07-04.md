@@ -303,3 +303,26 @@ training process, leaving the A100 mostly idle and taking about 173 seconds
 for the smoke run. Moving view generation into 12 persistent DataLoader
 workers with pinned-memory transfer reduced the same smoke run to 72 seconds
 without changing the loss or augmentation policy.
+
+## Paper-aligned Phase 3 result (2026-07-05)
+
+Two accidentally concurrent Phase 3 processes were stopped and their shared
+log/checkpoints were discarded. The clean run fixed AP evaluation confidence
+filtering (`0.001` for ranking) and grouped GT matching by image.
+
+The complete 50-epoch Japan-to-Czech run selected epoch 49 using Japan
+validation only:
+
+| Evaluation | mAP@50 | mAP@[.5:.95] |
+|---|---:|---:|
+| Exact 500-image Japan training subset | 25.05% | 9.03% |
+| Japan validation | 3.52% | 0.85% |
+| Czech zero-shot (final evaluation only) | 0.91% | 0.35% |
+
+The detector can fit the sampled training set but fails to generalize even
+within Japan, before target-domain shift is considered. The completed Phase 2
+also differs from the supplement in two material ways: it freezes the DAPA
+projection head although Algorithm 1 updates it, and it uses a constant
+learning rate instead of the stated 10-epoch warmup plus 190-epoch cosine
+schedule. These must be corrected in a future Phase 2 rerun before attributing
+the remaining gap to Phase 3 box assignment.
