@@ -813,8 +813,7 @@ def main() -> None:
                         help="Disable torch.compile (A100: ~20 pct speedup when enabled)")
     parser.add_argument(
         "--phase", type=int, choices=[1, 2, 3], default=None,
-        help="Run only a specific phase "
-             "(3 = detection only, requires --resume)",
+        help="Stop after phase 1 or 2; phase 3 requires --resume",
     )
     parser.add_argument(
         "--resume", type=str, default=None,
@@ -926,7 +925,7 @@ def main() -> None:
     # ======================================================================
 
     # --- Phase 1: SPEM discovery --------------------------------------------
-    if args.phase is None or args.phase == 1:
+    if args.phase is None or args.phase in (1, 2):
         print("\n" + "=" * 60)
         print("Phase 1: SPEM Prototype Discovery")
         print("=" * 60)

@@ -32,6 +32,8 @@ detection:
   architecture: paper
   paper_mid_dim: 384
   paper_neck_dim: 128
+  hidden_dim: 256
+  head_depth: 3
   source_label_fraction: 0.0595238095  # 500 / 8400 Japan training images
   cls_prior: 0.01
 
@@ -66,4 +68,4 @@ data:
   val_manifest: /PROBE/data/czech_val.jsonl
   image_root: /PROBE/data/images
   batch_size: 64
-  num_workers: 8
+  num_workers: 4

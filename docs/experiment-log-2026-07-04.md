@@ -257,3 +257,43 @@ matched boxes and confidences are fused before the existing per-class Top-K
 selection. Uncertain target images are omitted rather than trained as
 background. The mixed dataset retains all labeled Japan images, and the
 student's EMA checkpoint becomes the next teacher.
+
+The reproduced 30-epoch/512px Japan teacher reached 55.04% Japan mAP@50 and
+12.20% Czech mAP@50. Its 512px and 640px target predictions contained 2,934
+and 3,175 boxes respectively. Requiring equal class, confidence >= 0.10, and
+IoU >= 0.60 retained 1,052 boxes on 723 Czech training images.
+
+After 10 epochs of strong-view student training, with all 8,400 labeled Japan
+images replayed and checkpoint selection on Japan validation only:
+
+| Model | Japan mAP@50 | Czech mAP@50 | Czech mAP@[.5:.95] |
+|---|---:|---:|---:|
+| Reproduced teacher | 55.04% | 12.20% | 4.03% |
+| Quality-aware EMA student | 55.44% | 12.60% | 4.20% |
+
+The +0.40 target gain passes the same-teacher gate but remains below the
+historical 13.50% source-only result. A second pseudo-label round is therefore
+not justified.
+
+### Paper-alignment fixes
+
+The WACV supplement exposed several mismatches in the scaffold:
+
+1. Algorithm 1 applies SimSiam to both source and target mini-batches. The
+   implementation previously used target views only. Phase 2 now constructs
+   two independent views for both domains and averages their SimSiam losses.
+2. `RoadDamageDataset(unlabeled=True)` strips boxes and labels while loading
+   target manifests, making it impossible for Czech annotations to enter
+   Phase 1 or Phase 2.
+3. A paper-aligned configuration now uses 200 Phase-2 epochs at 224px,
+   batch 64, prompt hidden dimension 192, 300 K-means iterations, and a
+   separate 50-epoch Phase 3 at 512px with 500 labeled Japan images.
+4. Cross-resolution Phase-2 to Phase-3 loading now skips incompatible frozen
+   positional-embedding tensors while restoring compatible learned prompt
+   parameters.
+5. `--phase 2` now runs Phase 1 first instead of failing with an undefined
+   prototype state.
+
+A one-epoch end-to-end Phase-2 smoke test completed successfully. The formal
+run uses all 2,260 Czech training images for prototype discovery (442,960
+patch tokens) and then 200 epochs of dual-domain self-supervised pretraining.
