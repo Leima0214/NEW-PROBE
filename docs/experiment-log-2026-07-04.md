@@ -297,3 +297,9 @@ The WACV supplement exposed several mismatches in the scaffold:
 A one-epoch end-to-end Phase-2 smoke test completed successfully. The formal
 run uses all 2,260 Czech training images for prototype discovery (442,960
 patch tokens) and then 200 epochs of dual-domain self-supervised pretraining.
+
+The initial implementation generated four augmented views serially in the
+training process, leaving the A100 mostly idle and taking about 173 seconds
+for the smoke run. Moving view generation into 12 persistent DataLoader
+workers with pinned-memory transfer reduced the same smoke run to 72 seconds
+without changing the loss or augmentation policy.

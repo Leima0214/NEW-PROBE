@@ -77,6 +77,14 @@ def simsiam_transform(image_size: int = 512) -> T.Compose:
     ])
 
 
+class TwoViewTransform:
+    def __init__(self, transform) -> None:
+        self.transform = transform
+
+    def __call__(self, image):
+        return self.transform(image), self.transform(image)
+
+
 def eval_transform(image_size: int = 512) -> T.Compose:
     """Simple resize + normalise transform for evaluation."""
     return T.Compose([
@@ -119,6 +127,12 @@ def detection_collate(batch: list) -> tuple:
     if isinstance(images[0], torch.Tensor):
         images = torch.stack(images, 0)
     return images, targets
+
+
+def ssl_collate(batch: list) -> tuple:
+    views, targets = zip(*batch)
+    view1, view2 = zip(*views)
+    return (torch.stack(view1), torch.stack(view2)), targets
 
 
 def _label_counts(dataset: RoadDamageDataset | Subset) -> dict[int, int]:
@@ -199,36 +213,45 @@ def train_ssl_pretraining(
     print("=" * 60)
 
     image_size = args.image_size
+    two_views = TwoViewTransform(simsiam_transform(image_size))
 
     # --- Datasets -----------------------------------------------------------
     source_dataset = RoadDamageDataset(
         cfg["data"]["source_manifest"],
         cfg["data"]["image_root"],
+        transform=two_views,
         image_size=image_size,
     )
     target_ssl_dataset = RoadDamageDataset(
         cfg["data"]["target_manifest"],
         cfg["data"]["image_root"],
+        transform=two_views,
         image_size=image_size,
         unlabeled=True,
     )
 
     batch_size = cfg["data"]["batch_size"]
+    num_workers = cfg["data"]["num_workers"]
+    loader_options = {
+        "num_workers": num_workers,
+        "persistent_workers": num_workers > 0,
+        "pin_memory": device.type == "cuda",
+    }
     source_loader = DataLoader(
         source_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=cfg["data"]["num_workers"],
         drop_last=True,
-        collate_fn=detection_collate,
+        collate_fn=ssl_collate,
+        **loader_options,
     )
     target_loader = DataLoader(
         target_ssl_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=cfg["data"]["num_workers"],
         drop_last=True,
-        collate_fn=detection_collate,
+        collate_fn=ssl_collate,
+        **loader_options,
     )
 
     # --- Optimiser ----------------------------------------------------------
@@ -256,7 +279,6 @@ def train_ssl_pretraining(
     amp_enabled = use_amp and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_enabled and amp_dtype == torch.float16))
 
-    ssl_aug = simsiam_transform(image_size)
     prompt_weight = cfg["spem"]["prompt_weight"]
     dapa_weight = cfg["dapa"]["weight"]
     prompt_temperature = cfg["spem"]["prompt_temperature"]
@@ -279,14 +301,16 @@ def train_ssl_pretraining(
         optimizer.zero_grad(set_to_none=True)
         steps = 0
 
-        for step, ((source_imgs, _), (target_imgs, _)) in enumerate(
+        for step, ((source_views, _), (target_views, _)) in enumerate(
             zip(source_loader, target_loader)
         ):
             # Algorithm 1 applies SimSiam to both source and target domains.
-            source_view1 = torch.stack([ssl_aug(img) for img in source_imgs]).to(device)
-            source_view2 = torch.stack([ssl_aug(img) for img in source_imgs]).to(device)
-            target_view1 = torch.stack([ssl_aug(img) for img in target_imgs]).to(device)
-            target_view2 = torch.stack([ssl_aug(img) for img in target_imgs]).to(device)
+            source_view1, source_view2 = (
+                view.to(device, non_blocking=True) for view in source_views
+            )
+            target_view1, target_view2 = (
+                view.to(device, non_blocking=True) for view in target_views
+            )
 
             with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 metrics = probe_pretrain_step(

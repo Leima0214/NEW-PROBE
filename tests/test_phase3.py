@@ -41,6 +41,7 @@ assert _TRAIN_SPEC is not None and _TRAIN_SPEC.loader is not None
 _TRAIN_MODULE = importlib.util.module_from_spec(_TRAIN_SPEC)
 _TRAIN_SPEC.loader.exec_module(_TRAIN_MODULE)
 _label_counts = _TRAIN_MODULE._label_counts
+ssl_collate = _TRAIN_MODULE.ssl_collate
 
 
 class DetectionDataTests(unittest.TestCase):
@@ -117,6 +118,18 @@ class DetectionDataTests(unittest.TestCase):
             self.assertEqual(dataset.samples, [{"image": "sample.jpg"}])
             self.assertEqual(target["boxes"].numel(), 0)
             self.assertEqual(target["labels"].numel(), 0)
+
+    def test_ssl_collate_stacks_both_views(self) -> None:
+        batch = [
+            ((torch.ones(3, 4, 4), torch.zeros(3, 4, 4)), {"id": 0}),
+            ((torch.ones(3, 4, 4) * 2, torch.zeros(3, 4, 4)), {"id": 1}),
+        ]
+
+        (view1, view2), targets = ssl_collate(batch)
+
+        self.assertEqual(tuple(view1.shape), (2, 3, 4, 4))
+        self.assertEqual(tuple(view2.shape), (2, 3, 4, 4))
+        self.assertEqual([target["id"] for target in targets], [0, 1])
 
 
 class DetectionModelTests(unittest.TestCase):

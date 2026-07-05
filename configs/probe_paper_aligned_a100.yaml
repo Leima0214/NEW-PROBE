@@ -68,4 +68,4 @@ data:
   val_manifest: /PROBE/data/czech_val.jsonl
   image_root: /PROBE/data/images
   batch_size: 64
-  num_workers: 4
+  num_workers: 6
