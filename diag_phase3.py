@@ -9,6 +9,7 @@ import timm
 import torch
 import torchvision.transforms as T
 import yaml
+from torch.utils.data import Subset
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -34,6 +35,7 @@ def main() -> None:
         choices=("source_manifest", "source_val_manifest", "target_manifest", "val_manifest"),
     )
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--match-training-subset", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--image-size", type=int, default=512)
     args = parser.parse_args()
@@ -108,6 +110,18 @@ def main() -> None:
         image_size=args.image_size,
         num_classes=cfg["detection"]["num_classes"],
     )
+    if args.match_training_subset:
+        if args.manifest_key != "source_manifest":
+            raise ValueError("--match-training-subset requires --manifest-key source_manifest")
+        sample_count = max(
+            1,
+            round(len(dataset) * float(cfg["detection"]["source_label_fraction"])),
+        )
+        generator = torch.Generator().manual_seed(int(cfg.get("seed", 42)))
+        dataset = Subset(
+            dataset,
+            torch.randperm(len(dataset), generator=generator)[:sample_count].tolist(),
+        )
     feature_size = args.image_size // 16
     metrics = evaluate_map(
         model,
